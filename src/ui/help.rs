@@ -37,6 +37,12 @@ and ← move focus instead. / in the tree searches recursively, \
 walking into closed directories and opening the path to every match; Esc restores the shape \
 you had open. Set ui.mouse = false to hand the mouse back to your terminal.";
 
+const JSONL: &str = "A zoomed .jsonl lists its records, each folded onto one row. →, Enter \
+or space unfolds the selected one to its top level, then the objects and arrays inside it a \
+level at a time. ← winds back out, folding what is open and stepping out of what is not, and \
+leaves the zoom only once nothing is left to close; Esc leaves at once. Folded rows are \
+truncated — unfolding is how you see the rest — and everything else wraps.";
+
 const MOUSE: &[(&str, &str)] = &[
     ("click", "focus the pane, select the row"),
     ("double-click", "expand / collapse, or open"),
@@ -59,8 +65,12 @@ pub fn draw(frame: &mut Frame, area: Rect) {
         Constraint::Min(3),
     ])
     .areas(left);
-    let [actions, config] =
-        Layout::vertical([Constraint::Length(10), Constraint::Min(4)]).areas(right);
+    let [actions, jsonl, config] = Layout::vertical([
+        Constraint::Length(10),
+        Constraint::Min(4),
+        Constraint::Min(4),
+    ])
+    .areas(right);
 
     frame.render_widget(keys("Navigation", NAVIGATION, nav.width), nav);
     frame.render_widget(keys("Mouse", MOUSE, mouse.width), mouse);
@@ -71,6 +81,13 @@ pub fn draw(frame: &mut Frame, area: Rect) {
             .wrap(Wrap { trim: false })
             .block(panel("Layout")),
         about,
+    );
+
+    frame.render_widget(
+        Paragraph::new(Text::styled(JSONL, Theme::dim()))
+            .wrap(Wrap { trim: false })
+            .block(panel("JSONL")),
+        jsonl,
     );
 
     frame.render_widget(

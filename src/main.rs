@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod jsonl;
 mod lakefs;
 mod theme;
 mod ui;
@@ -284,9 +285,10 @@ fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
                 app.back();
             }
         }
-        // Expand or collapse in place, without moving focus.
+        // Expand or collapse in place, without moving focus. Zoomed, the only
+        // thing with anything to fold is a JSONL record; `toggle` knows.
         KeyCode::Char(' ') => {
-            if app.tab == Tab::Browse && app.mode != Mode::Zoom {
+            if app.tab == Tab::Browse {
                 app.toggle();
             }
         }

@@ -103,8 +103,8 @@ secrets need not be stored on disk. `lakeview init` writes the file with mode
 | Key | Action |
 |---|---|
 | `j` `k` / `↓` `↑` | move |
-| `l` `→` `Enter` | expand; at a pane's edge, move focus right; on a file, zoom the preview |
-| `h` `←` `Backspace` | collapse, else go to the parent; at the top level, move focus left |
+| `l` `→` `Enter` | expand; at a pane's edge, move focus right; on a file, zoom the preview; in a zoomed `.jsonl`, unfold a record |
+| `h` `←` `Backspace` | collapse, else go to the parent; at the top level, move focus left, or leave a zoom |
 | `space` | expand / collapse in place, without moving focus |
 | `g` / `G` | first / last entry |
 | `Ctrl-d` / `Ctrl-u` | half-page down / up |
@@ -132,6 +132,47 @@ A search stops after `search_max_requests` directory listings and says so
 rather than quietly returning a partial result. Nothing is fetched twice, so
 extending the search term costs nothing.
 
+## JSONL
+
+Zooming a `.jsonl` or `.ndjson` file (`→` on it in the tree) gives every record
+a row of its own, folded onto one line. `→`, `Enter` or `space` unfolds the
+selected record to its top level; the objects and arrays inside it stay folded
+on a row each, marked `▸`, and unfold a level at a time in turn:
+
+```
+╭ events.jsonl ───────────────────────────────── zoom  ╮
+│                                                      │
+│  1 ▸ {"level": "info", "msg": "boot", "meta": {…}}   │
+│  2 ▾ {4}                                             │
+│    │ {                                               │
+│    │   "level": "warn",                              │
+│    │   "msg": "retry",                               │
+│    │ ▾ "meta": {                                     │
+│    │     "pid": 11,                                  │
+│    │   ▸ "tags": ["x", "y"]                          │
+│    │   }                                             │
+│    │ }                                                │
+╰──────────────────────────────────────────────────────╯
+```
+
+The same keys fold a block back up, from its opening row or its closing bracket
+either way, and what was open inside it is remembered.
+
+`←` winds back out the way it does in the tree: it folds what is open, steps out
+to the enclosing block when there is nothing there to fold, and only once the
+whole record is folded again does it leave the zoom. `Esc` leaves at once.
+
+A folded row is truncated rather than wrapped — unfolding it is how you see the
+rest, and re-flowing one record over ten lines would bury the records under it.
+Everything else wraps, so the long values an unfolded record exposes are
+readable at full width.
+
+The side pane leaves `.jsonl` alone and shows it as the plain lines it is: at
+that width there is no room to fold anything usefully. A record that isn't valid
+JSON stays visible in red with the parse error beside it, and unfolds to show
+the message and the raw text. Records lost to the `preview_bytes` cap are marked
+`truncated` in the pane's title rather than shown half-read.
+
 ## Mouse
 
 Mouse support is on by default.
@@ -143,7 +184,8 @@ Mouse support is on by default.
 | right-click | collapse, or go back |
 | wheel over the focused pane | move the selection (the preview follows) |
 | wheel over the other pane | scroll that pane's view only — no focus or selection change |
-| wheel over the preview | scroll the preview |
+| wheel over the preview | scroll the preview, or move the selection in a zoomed `.jsonl` |
+| double-click a zoomed `.jsonl` row | unfold or fold it |
 | click a tab | switch tab |
 
 Capturing the mouse takes over your terminal's click-drag text selection; most
@@ -170,4 +212,5 @@ selection, set `mouse = false` under `[ui]` and everything stays keyboard-driven
   at that width, wrapping one long JSON string would bury the rest of the file.
 - JSON is re-indented and syntax-coloured, preserving the file's key order. A
   file too large to fetch whole won't parse, so it renders as plain text.
+- `.jsonl` and `.ndjson` files unfold record by record — see below.
 - Everything is read-only — lakeview never writes to your lakeFS server.

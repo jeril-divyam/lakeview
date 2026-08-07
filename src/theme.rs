@@ -111,6 +111,10 @@ impl Theme {
             Bool => Style::new().fg(Self::PURPLE).add_modifier(Modifier::BOLD),
             Null => Style::new().fg(Self::FAINT).add_modifier(Modifier::ITALIC),
             Punct => Style::new().fg(Self::DIM),
+            // The same amber the tree pane gives its own fold markers, so one
+            // glyph means the same thing wherever it turns up.
+            Marker => Style::new().fg(Self::ACCENT),
+            Error => Style::new().fg(Self::RED),
         }
     }
 }

@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{format_ts, human_size, justify, truncate};
 use crate::app::{App, Focus, Load, Mode, PreviewBody, ReposRow, ReposView, RowKind, TreeView};
+use crate::jsonl::DocRow;
 use crate::theme::Theme;
 
 /// Floors the configured widths are held to, so no ratio can squeeze a pane
@@ -27,6 +28,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     app.hits.repos = None;
     app.hits.tree = None;
     app.hits.preview = None;
+    app.hits.preview_rows.clear();
     app.hits.commits = None;
 
     if app.mode == Mode::Zoom {
@@ -360,14 +362,19 @@ fn render_tree_row(tree: &TreeView, slot: usize, width: usize, tick: usize) -> L
 // ── pane 3: detail / preview ─────────────────────────────────────────────
 
 /// Renders the detail/preview pane and returns its inner area.
-fn draw_detail(frame: &mut Frame, app: &App, area: Rect, zoomed: bool) -> Rect {
+fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, zoomed: bool) -> Rect {
     let heading = match app.focus {
         Focus::Repos => app.repos.selected_row().map(|r| r.label.clone()),
         Focus::Tree => app.tree.selected().map(|n| n.name.clone()),
     }
     .unwrap_or_else(|| "Details".into());
 
+    // Records dropped with the fetch are worth saying out loud: unlike a cut
+    // line of text, a missing record leaves nothing behind to notice.
     let mut right = Vec::new();
+    if app.jsonl().is_some_and(|doc| doc.truncated) {
+        right.push(Span::styled(" truncated ", Theme::faint()));
+    }
     if zoomed {
         right.push(Span::styled(" zoom ", Theme::chip()));
         right.push(Span::raw(" "));
@@ -377,6 +384,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, zoomed: bool) -> Rect {
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // A zoomed JSONL preview is a list of its own, with a selection and rows to
+    // unfold, so it draws itself rather than flattening to a paragraph.
+    if zoomed && app.jsonl().is_some() {
+        draw_jsonl(frame, app, inner);
+        return inner;
+    }
 
     let mut lines = match app.focus {
         Focus::Repos => repos_detail(app),
@@ -396,9 +410,193 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, zoomed: bool) -> Rect {
             .collect();
     }
 
-    let paragraph = Paragraph::new(Text::from(lines)).scroll((app.preview.scroll, 0));
+    // Scrolling is clamped here because this is the only place the wrapped
+    // height is known — which is also what lets `G` ask for the bottom.
+    let scroll = clamp_scroll(app.preview.scroll, lines.len(), inner.height);
+    app.preview.scroll = scroll;
+    let paragraph = Paragraph::new(Text::from(lines)).scroll((scroll, 0));
     frame.render_widget(paragraph, inner);
     inner
+}
+
+/// Hold a scroll offset to a body of `lines` rendered `height` rows tall.
+fn clamp_scroll(scroll: u16, lines: usize, height: u16) -> u16 {
+    let max = lines.saturating_sub(height as usize);
+    scroll.min(max.min(u16::MAX as usize) as u16)
+}
+
+// ── the zoomed JSONL view ────────────────────────────────────────────────
+
+/// One record per row, each unfolding a level at a time.
+///
+/// A row showing a folded value is truncated rather than wrapped — unfolding it
+/// is how you see the rest, and wrapping a whole record over ten lines would
+/// bury the records under it. Everything else wraps, so the long string values
+/// an unfolded record exposes can be read at full width.
+fn draw_jsonl(frame: &mut Frame, app: &mut App, area: Rect) {
+    let (width, height) = (area.width as usize, area.height as usize);
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    // Take everything the layout needs by value, so the doc isn't still
+    // borrowed when the scroll and the hit map are written back.
+    let Some((rows, cursor, gutter)) = app.jsonl().map(|doc| {
+        let rows = doc.rows();
+        let cursor = doc.cursor.min(rows.len().saturating_sub(1));
+        (rows, cursor, doc.entries.len().to_string().len().max(2))
+    }) else {
+        return;
+    };
+    if rows.is_empty() {
+        frame.render_widget(centered_note("no records", Theme::faint()), area);
+        return;
+    }
+    let lines = jsonl_layout(&rows, gutter, cursor, width);
+    let first = lines.iter().position(|(r, _)| *r == cursor).unwrap_or(0);
+    let last = lines
+        .iter()
+        .rposition(|(r, _)| *r == cursor)
+        .map_or(first + 1, |i| i + 1);
+
+    let top = reveal(app.preview.scroll as usize, first, last, height, lines.len());
+    app.preview.scroll = top.min(u16::MAX as usize) as u16;
+
+    let visible = lines.iter().skip(top).take(height);
+    app.hits.preview_rows = visible.clone().map(|(row, _)| *row).collect();
+    for (y, (_, line)) in visible.enumerate() {
+        let slot = Rect::new(area.x, area.y + y as u16, area.width, 1);
+        frame.render_widget(line, slot);
+    }
+}
+
+/// Lay every row out into the screen lines it occupies, each tagged with the row
+/// it came from. Everything is laid out, not just what is on screen: the cursor
+/// cannot be revealed, nor the view held to the end of the body, without knowing
+/// how tall the rows above it are.
+fn jsonl_layout(
+    rows: &[DocRow],
+    gutter: usize,
+    cursor: usize,
+    width: usize,
+) -> Vec<(usize, Line<'static>)> {
+    let cursor_entry = rows.get(cursor).map(|r| r.entry);
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let line = jsonl_line(row, gutter, Some(row.entry) == cursor_entry);
+        let laid_out = if row.folded {
+            vec![truncate_line(line, width)]
+        } else {
+            let indent = hanging_indent(&line);
+            wrap_line(line, width, indent)
+        };
+        for line in laid_out {
+            // The whole of a wrapped row lights up, so the selection reads as
+            // one row rather than as the one line the cursor happens to be on.
+            let line = if i == cursor {
+                line.style(Theme::selection(true))
+            } else {
+                line
+            };
+            out.push((i, line));
+        }
+    }
+    out
+}
+
+/// Where the view should start so that the selected row — lines `first..last` —
+/// is on screen, moving as little as it can.
+fn reveal(top: usize, first: usize, last: usize, height: usize, total: usize) -> usize {
+    let top = if first < top {
+        // Scrolled past the selection: bring it back to the top edge.
+        first
+    } else if last > top + height {
+        // Below the fold: show as much of the row as fits, without ever pushing
+        // its first line off the top — one taller than the screen reads from
+        // its start.
+        if last - first <= height {
+            last - height
+        } else {
+            first
+        }
+    } else {
+        top
+    };
+    // Never leave blank rows under the end of the body.
+    top.min(total.saturating_sub(height))
+}
+
+/// A record's row: the gutter, then the row's own coloured cells. The record
+/// number lights up for every row of the record the cursor is inside, and the
+/// body of an expanded record hangs off it under a rule.
+fn jsonl_line(row: &DocRow, gutter: usize, lit: bool) -> Line<'static> {
+    let mut spans = Vec::with_capacity(row.cells.len() + 1);
+    if row.sub == 0 {
+        let style = if lit {
+            Theme::accent_bold()
+        } else {
+            Theme::faint()
+        };
+        spans.push(Span::styled(
+            format!("{:>gutter$} ", row.entry + 1),
+            style,
+        ));
+    } else {
+        spans.push(Span::styled(
+            format!("{:>gutter$} │ ", ""),
+            Theme::faint(),
+        ));
+    }
+    spans.extend(
+        row.cells
+            .iter()
+            .map(|(tok, text)| Span::styled(text.clone(), Theme::json(*tok))),
+    );
+    Line::from(spans)
+}
+
+/// Cut a line to `width` display columns, marking the cut with an ellipsis.
+/// Unlike `wrap_line` this keeps the row one row tall, whatever it holds.
+fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
+    let total: usize = line.spans.iter().map(|s| s.content.width()).sum();
+    if total <= width {
+        return line;
+    }
+    if width == 0 {
+        return Line::default();
+    }
+    let style = line.style;
+    let room = width - 1;
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for span in line.spans {
+        if used == room {
+            break;
+        }
+        let span_width = span.content.width();
+        if used + span_width <= room {
+            used += span_width;
+            spans.push(span);
+            continue;
+        }
+        // The cut lands inside this span; keep whichever characters still fit.
+        let mut kept = String::new();
+        for ch in span.content.chars() {
+            let w = char_width(ch);
+            if used + w > room {
+                break;
+            }
+            used += w;
+            kept.push(ch);
+        }
+        if !kept.is_empty() {
+            spans.push(Span::styled(kept, span.style));
+        }
+        break;
+    }
+    spans.push(Span::styled("…", Theme::faint()));
+    Line::from(spans).style(style)
 }
 
 /// Where a wrapped continuation should start: under the content, past the
@@ -648,6 +846,17 @@ fn preview_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 ]));
             }
         }
+        // Records are only worth folding at full width, so the side pane shows
+        // them as the lines they are; `→` zooms to the one that unfolds them.
+        Some(PreviewBody::Jsonl(doc)) => {
+            let gutter = doc.entries.len().to_string().len().max(2);
+            for (i, entry) in doc.entries.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:>gutter$} ", i + 1), Theme::faint()),
+                    Span::styled(entry.raw.clone(), Theme::file()),
+                ]));
+            }
+        }
     }
     lines
 }
@@ -746,5 +955,234 @@ mod tests {
     fn a_pane_too_narrow_to_wrap_is_left_alone() {
         let line = Line::from(vec![Span::raw(" 1 "), Span::raw("something long")]);
         assert_eq!(wrapped(line, 4).len(), 1);
+    }
+
+    // ── the zoomed JSONL view ────────────────────────────────────────────
+
+    #[test]
+    fn a_line_that_fits_is_not_truncated() {
+        let line = Line::from(vec![Span::raw(" 1 "), Span::raw("hello")]);
+        assert_eq!(text(&truncate_line(line, 40)), " 1 hello");
+    }
+
+    #[test]
+    fn truncation_fills_the_width_exactly_and_marks_the_cut() {
+        let line = Line::from(vec![Span::raw(" 1 "), Span::raw("alpha beta gamma")]);
+        let cut = truncate_line(line, 10);
+        assert_eq!(text(&cut), " 1 alpha …");
+        assert_eq!(cut.width(), 10);
+    }
+
+    #[test]
+    fn truncation_keeps_the_styles_of_what_it_kept() {
+        let keyed = Style::new().fg(Theme::ACCENT);
+        let line = Line::from(vec![
+            Span::raw(" 1 "),
+            Span::styled("x".repeat(40), keyed),
+        ]);
+        let cut = truncate_line(line, 12);
+        assert_eq!(cut.width(), 12);
+        for span in cut.spans.iter().filter(|s| s.content.contains('x')) {
+            assert_eq!(span.style, keyed);
+        }
+    }
+
+    #[test]
+    fn truncation_never_splits_a_wide_character_in_half() {
+        let line = Line::from(vec![Span::raw("ab"), Span::raw("我我我")]);
+        // Room for one wide character and the ellipsis, not one and a half.
+        let cut = truncate_line(line, 5);
+        assert_eq!(text(&cut), "ab我…");
+        assert_eq!(cut.width(), 5);
+    }
+
+    /// A record's own row and its body rows have to start their content in the
+    /// same column, or an expanded record reads as two different indents.
+    #[test]
+    fn the_record_gutter_and_the_body_gutter_are_the_same_width() {
+        use crate::app::JsonTok;
+
+        let header = DocRow {
+            entry: 6,
+            sub: 0,
+            cells: vec![(JsonTok::Marker, "▸ ".into())],
+            toggle: None,
+            parent: None,
+            folded: true,
+        };
+        let body = DocRow {
+            entry: 6,
+            sub: 1,
+            cells: vec![(JsonTok::Punct, "{".into())],
+            toggle: None,
+            parent: None,
+            folded: false,
+        };
+        let width = |row: &DocRow| {
+            let line = jsonl_line(row, 3, false);
+            hanging_indent(&line)
+        };
+        // The header's marker takes the two columns the body's rule does.
+        assert_eq!(width(&header) + 2, width(&body));
+        assert_eq!(text(&jsonl_line(&header, 3, false)), "  7 ▸ ");
+        assert_eq!(text(&jsonl_line(&body, 3, false)), "    │ {");
+    }
+
+    fn laid_out(doc: &crate::jsonl::Doc, width: usize) -> Vec<String> {
+        jsonl_layout(&doc.rows(), 2, doc.cursor, width)
+            .iter()
+            .map(|(_, line)| text(line))
+            .collect()
+    }
+
+    #[test]
+    fn a_folded_record_stays_one_row_however_long_it_is() {
+        let raw = format!(r#"{{"k":"{}"}}"#, "x".repeat(300));
+        let doc = crate::jsonl::parse(&format!("{raw}\n"), false);
+        let lines = laid_out(&doc, 40);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with('…'));
+        assert_eq!(lines[0].width(), 40);
+    }
+
+    #[test]
+    fn an_unfolded_value_wraps_instead_of_being_cut() {
+        let raw = format!(r#"{{"k":"{}"}}"#, "x".repeat(300));
+        let mut doc = crate::jsonl::parse(&format!("{raw}\n"), false);
+        doc.toggle_row(0);
+        let lines = laid_out(&doc, 40);
+        // "▾ {1}", "{", the wrapped "k" member, "}".
+        assert!(lines.len() > 4, "{} lines is not wrapped", lines.len());
+        assert!(!lines.iter().any(|l| l.ends_with('…')), "{lines:?}");
+        for line in &lines {
+            assert!(line.width() <= 40, "{line:?} overflows the pane");
+        }
+        // Every x survives the break.
+        let joined: String = lines.concat();
+        assert_eq!(joined.matches('x').count(), 300);
+    }
+
+    #[test]
+    fn a_folded_child_is_cut_even_inside_an_unfolded_record() {
+        let raw = format!(r#"{{"k":{{"deep":"{}"}}}}"#, "x".repeat(300));
+        let mut doc = crate::jsonl::parse(&format!("{raw}\n"), false);
+        doc.toggle_row(0);
+        let lines = laid_out(&doc, 40);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[2].contains("▸ "), "{:?}", lines[2]);
+        assert!(lines[2].ends_with('…'));
+    }
+
+    #[test]
+    fn the_layout_maps_every_screen_line_back_to_its_row() {
+        let raw = format!(r#"{{"k":"{}"}}"#, "x".repeat(300));
+        let mut doc = crate::jsonl::parse(&format!("{raw}\n{raw}\n"), false);
+        doc.toggle_row(0);
+        let rows = doc.rows();
+        let lines = jsonl_layout(&rows, 2, doc.cursor, 40);
+        // Monotonic, starting at 0, and never naming a row that isn't there.
+        assert_eq!(lines[0].0, 0);
+        assert!(lines.windows(2).all(|w| w[1].0 == w[0].0 || w[1].0 == w[0].0 + 1));
+        assert_eq!(lines.last().unwrap().0, rows.len() - 1);
+    }
+
+    #[test]
+    fn the_view_follows_the_selection() {
+        // Already on screen: nothing moves.
+        assert_eq!(reveal(10, 12, 13, 20, 100), 10);
+        // Above the top edge.
+        assert_eq!(reveal(10, 4, 5, 20, 100), 4);
+        // Below the bottom edge: scrolled just far enough.
+        assert_eq!(reveal(10, 40, 41, 20, 100), 21);
+        // A wrapped row is brought on screen whole where it fits …
+        assert_eq!(reveal(0, 15, 20, 20, 100), 0);
+        assert_eq!(reveal(0, 25, 30, 20, 100), 10);
+        // … and read from its start where it does not.
+        assert_eq!(reveal(0, 25, 60, 20, 100), 25);
+    }
+
+    #[test]
+    fn the_view_never_scrolls_past_the_end() {
+        assert_eq!(reveal(90, 95, 96, 20, 100), 80);
+        // A body shorter than the pane never scrolls at all.
+        assert_eq!(reveal(5, 2, 3, 20, 8), 0);
+    }
+
+    /// Drives the real draw path — pane frame, layout, clipping and all — over
+    /// a JSONL preview, which the pure-function tests above never touch.
+    #[tokio::test]
+    async fn the_zoomed_view_draws_what_the_cursor_is_on() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let profile = crate::config::Profile {
+            // Nothing is fetched; the client only has to exist.
+            endpoint: "http://127.0.0.1:1".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+            default_repo: None,
+            default_ref: None,
+            verify_tls: true,
+            timeout_secs: 1,
+            description: None,
+        };
+        let client = crate::lakefs::Client::new(&profile, 500).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            crate::config::Config::default(),
+            "test".into(),
+            profile,
+            client,
+            tx,
+        );
+
+        let mut doc = crate::jsonl::parse("{\"a\":1}\n{\"b\":{\"c\":2}}\n", false);
+        doc.cursor = 1;
+        doc.toggle_row(1);
+        app.preview.body = Some(PreviewBody::Jsonl(doc));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let screen: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let all = screen.join("\n");
+
+        // The first record stays folded, the second is open to its top level.
+        assert!(all.contains(r#"▸ {"a": 1}"#), "{all}");
+        assert!(all.contains("▾ {1}"), "{all}");
+        assert!(all.contains(r#"▸ "b": {"c": 2}"#), "{all}");
+        assert!(all.contains(" zoom "), "{all}");
+
+        // The selected row is the one wearing the selection background, across
+        // the whole width of the pane rather than just its text.
+        let pane = app.hits.preview.expect("the zoom records its own area");
+        let lit: Vec<u16> = (pane.y..pane.y + pane.height)
+            .filter(|y| buffer[(pane.x, *y)].bg == Theme::SURFACE)
+            .collect();
+        assert_eq!(lit.len(), 1, "exactly one row is selected: {lit:?}");
+        let row = lit[0];
+        assert!(
+            screen[row as usize].contains("▾ {1}"),
+            "{:?}",
+            screen[row as usize]
+        );
+        assert_eq!(buffer[(pane.x + pane.width - 1, row)].bg, Theme::SURFACE);
+
+        // Every screen line of the pane maps back to a row, for the mouse.
+        assert!(!app.hits.preview_rows.is_empty());
+        assert!(app.hits.preview_rows.iter().all(|r| *r < 6));
     }
 }

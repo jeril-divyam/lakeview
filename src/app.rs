@@ -72,6 +72,8 @@ pub enum Msg {
 pub struct PreviewPayload {
     pub stat: ObjectStats,
     pub bytes: Vec<u8>,
+    /// The fetch came back at `preview_bytes`, so this is not the whole object.
+    pub truncated: bool,
 }
 
 // ── shared bits ──────────────────────────────────────────────────────────
@@ -533,6 +535,9 @@ pub enum PreviewBody {
     Text(Vec<String>),
     /// Re-indented JSON, tokenised so the UI can colour it.
     Json(Vec<JsonLine>),
+    /// Newline-delimited JSON, one foldable record per row. The side pane still
+    /// renders it as plain text; only the zoom unfolds it.
+    Jsonl(crate::jsonl::Doc),
     Binary(Vec<String>),
 }
 
@@ -547,6 +552,10 @@ pub enum JsonTok {
     Bool,
     Null,
     Punct,
+    /// The `▸` / `▾` a foldable JSONL row carries.
+    Marker,
+    /// A record that is not valid JSON, and the message saying so.
+    Error,
 }
 
 // ── modes & tabs ─────────────────────────────────────────────────────────
@@ -599,6 +608,9 @@ pub struct Hits {
     pub tree: Option<Rect>,
     /// Inner area of the detail/preview pane.
     pub preview: Option<Rect>,
+    /// For a zoomed JSONL preview, the row each screen line of that area shows.
+    /// A row that wrapped occupies several entries.
+    pub preview_rows: Vec<usize>,
     /// Inner area of the commit list.
     pub commits: Option<Rect>,
     /// (tab, label area) for each tab in the header.
@@ -722,6 +734,23 @@ impl App {
             .key
             .as_ref()
             .map(|(repo, reference)| (repo.as_str(), reference.as_str()))
+    }
+
+    /// The zoomed JSONL document, when that is what is on screen. Folding is a
+    /// zoom-only affair: the side pane is too narrow to read records in, and
+    /// shows them as plain text instead.
+    pub fn jsonl(&self) -> Option<&crate::jsonl::Doc> {
+        match (&self.mode, &self.preview.body) {
+            (Mode::Zoom, Some(PreviewBody::Jsonl(doc))) => Some(doc),
+            _ => None,
+        }
+    }
+
+    fn jsonl_mut(&mut self) -> Option<&mut crate::jsonl::Doc> {
+        match (&self.mode, &mut self.preview.body) {
+            (Mode::Zoom, Some(PreviewBody::Jsonl(doc))) => Some(doc),
+            _ => None,
+        }
     }
 
     /// The filter belonging to whichever pane has focus.
@@ -1017,6 +1046,7 @@ impl App {
                 .get_object_head(&repo, &reference, &object.path, limit)
                 .await
                 .map(|bytes| PreviewPayload {
+                    truncated: bytes.len() as u64 >= limit,
                     stat: object,
                     bytes,
                 })
@@ -1316,7 +1346,11 @@ impl App {
                 self.preview.loading = false;
                 match res {
                     Ok(payload) => {
-                        self.preview.body = Some(render_body(&payload.bytes));
+                        self.preview.body = Some(render_body(
+                            &payload.stat.path,
+                            &payload.bytes,
+                            payload.truncated,
+                        ));
                         self.preview.stat = Some(payload.stat);
                     }
                     Err(e) => self.preview.error = Some(e),
@@ -1463,12 +1497,17 @@ impl App {
                 let len = self.commits.commits.len();
                 move_in(&mut self.commits.state, len, delta);
             }
-            _ if self.mode == Mode::Zoom => {
-                self.preview.scroll = self
-                    .preview
-                    .scroll
-                    .saturating_add_signed(delta.clamp(-1000, 1000) as i16);
-            }
+            // A zoomed JSONL preview has rows to move between; anything else
+            // zoomed is a flat body, and moves the view itself.
+            _ if self.mode == Mode::Zoom => match self.jsonl_mut() {
+                Some(doc) => doc.move_cursor(delta),
+                None => {
+                    self.preview.scroll = self
+                        .preview
+                        .scroll
+                        .saturating_add_signed(delta.clamp(-1000, 1000) as i16);
+                }
+            },
             _ => match self.focus {
                 Focus::Repos => {
                     let len = self.repos.rows.len();
@@ -1486,6 +1525,16 @@ impl App {
     }
 
     pub fn select_edge(&mut self, first: bool) {
+        if self.mode == Mode::Zoom {
+            match self.jsonl_mut() {
+                Some(doc) => doc.select_edge(first),
+                // The render clamps this to the body's real height, which is
+                // the only place the wrapped line count is known.
+                None => self.preview.scroll = if first { 0 } else { u16::MAX },
+            }
+            return;
+        }
+
         let (state, len) = match self.tab {
             Tab::Commits => (&mut self.commits.state, self.commits.commits.len()),
             _ => match self.focus {
@@ -1534,6 +1583,14 @@ impl App {
     /// `→` — descend: expand a repository or directory, move focus at the pane
     /// edges, zoom a file.
     pub fn open(&mut self) {
+        // Already zoomed: descending means unfolding the selected record, and
+        // there is nothing else left to open.
+        if self.mode == Mode::Zoom {
+            if let Some(doc) = self.jsonl_mut() {
+                doc.toggle_cursor();
+            }
+            return;
+        }
         match self.focus {
             Focus::Repos => {
                 let Some(row) = self.repos.selected_row() else {
@@ -1579,6 +1636,13 @@ impl App {
     /// `←` — ascend: collapse, step to the parent, or move focus left.
     pub fn back(&mut self) {
         if self.mode == Mode::Zoom {
+            // A zoomed JSONL folds its way out a level at a time; the zoom is
+            // only what `←` leaves once nothing is left open.
+            if let Some(doc) = self.jsonl_mut()
+                && doc.back()
+            {
+                return;
+            }
             self.mode = Mode::Normal;
             return;
         }
@@ -1620,6 +1684,12 @@ impl App {
 
     /// `space` — expand or collapse in place, without moving focus.
     pub fn toggle(&mut self) {
+        if self.mode == Mode::Zoom {
+            if let Some(doc) = self.jsonl_mut() {
+                doc.toggle_cursor();
+            }
+            return;
+        }
         match self.focus {
             Focus::Repos => {
                 let Some(row) = self.repos.selected_row() else {
@@ -1674,6 +1744,11 @@ impl App {
 
     pub fn select_tab(&mut self, tab: Tab) {
         self.tab = tab;
+        // Zoom is a Browse-tab thing; leaving the tab leaves the zoom, but
+        // asking for the tab you are already on changes nothing.
+        if self.mode == Mode::Zoom && tab != Tab::Browse {
+            self.mode = Mode::Normal;
+        }
         if tab == Tab::Commits {
             if self.context().is_none() {
                 self.set_status("open a repository and ref in Browse first", false);
@@ -1724,6 +1799,12 @@ impl App {
 
         // Zoomed preview, or the preview pane in the normal layout.
         if self.mode == Mode::Zoom || self.hits.preview.is_some_and(|a| Hits::hit(a, col, row)) {
+            // A zoomed JSONL preview is the focused list, so the wheel moves its
+            // selection the way it does in any other focused pane.
+            if self.jsonl().is_some() {
+                self.move_selection(delta);
+                return;
+            }
             self.preview.scroll = if down {
                 self.preview.scroll.saturating_add(WHEEL_LINES as u16)
             } else {
@@ -1785,6 +1866,24 @@ impl App {
                 let line = self.commits.state.offset() + (row - area.y) as usize;
                 if line < self.commits.commits.len() {
                     self.commits.state.select(Some(line));
+                }
+            }
+            return;
+        }
+
+        // A zoomed JSONL preview: select the record under the pointer, and
+        // unfold it on the second click, as a double-click does everywhere else.
+        if self.jsonl().is_some()
+            && let Some(area) = self.hits.preview
+            && Hits::hit(area, col, row)
+        {
+            let Some(&line) = self.hits.preview_rows.get((row - area.y) as usize) else {
+                return;
+            };
+            if let Some(doc) = self.jsonl_mut() {
+                doc.cursor = line;
+                if double {
+                    doc.toggle_row(line);
                 }
             }
             return;
@@ -1931,8 +2030,16 @@ fn fmt_err(e: anyhow::Error) -> String {
     parts.join(": ")
 }
 
+/// Whether `path` names newline-delimited JSON. Decided by extension rather
+/// than by sniffing: a `.jsonl` full of broken records is still JSONL, and
+/// should say which records are broken instead of quietly rendering as text.
+fn is_jsonl(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".jsonl") || lower.ends_with(".ndjson")
+}
+
 /// Decide whether the fetched bytes are text; fall back to a hex dump.
-fn render_body(bytes: &[u8]) -> PreviewBody {
+fn render_body(path: &str, bytes: &[u8], truncated: bool) -> PreviewBody {
     let sample = &bytes[..bytes.len().min(8192)];
     let binary = sample.contains(&0)
         || String::from_utf8_lossy(sample)
@@ -1945,6 +2052,12 @@ fn render_body(bytes: &[u8]) -> PreviewBody {
         return PreviewBody::Binary(hex_dump(&bytes[..bytes.len().min(4096)]));
     }
     let text = String::from_utf8_lossy(bytes);
+
+    // One record per line, each folded up. Unlike whole-file JSON this survives
+    // truncation — every record but the last still parses on its own.
+    if is_jsonl(path) {
+        return PreviewBody::Jsonl(crate::jsonl::parse(&text, truncated));
+    }
 
     // Pretty-print JSON. A body truncated by `preview_bytes` won't parse, so
     // this quietly falls through to the plain-text path.
