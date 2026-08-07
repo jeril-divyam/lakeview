@@ -1,0 +1,30 @@
+# lakeview configuration — copy to ~/.config/lakeview.toml
+#
+# Credentials may be inlined or pulled from the environment with ${VAR}.
+# `lakeview init` generates this file for you (mode 600), seeding the first
+# profile from ~/.lakectl.yaml when one exists.
+
+default_profile = "local"
+
+[ui]
+column_width = 28       # min width of a Miller column before older ones collapse
+preview_percent = 38    # share of the screen given to the preview pane (0 disables)
+preview_bytes = 65536   # max bytes fetched when previewing a file
+page_size = 500         # entries fetched per API request (lakeFS caps at 1000)
+show_tags = true        # list tags alongside branches
+mouse = true            # set false to restore terminal click-drag text selection
+
+[profiles.local]
+endpoint = "http://localhost:8000"
+access_key_id = "AKIAIOSFOLQUICKSTART"
+secret_access_key = "${LAKEFS_SECRET_ACCESS_KEY}"
+# default_repo = "quickstart"
+# default_ref  = "main"
+
+[profiles.prod]
+endpoint = "https://lakefs.example.com"
+access_key_id = "${LAKEFS_PROD_KEY_ID}"
+secret_access_key = "${LAKEFS_PROD_SECRET}"
+description = "production cluster"
+verify_tls = true
+timeout_secs = 30
