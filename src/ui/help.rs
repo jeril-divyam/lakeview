@@ -32,7 +32,8 @@ const ACTIONS: &[(&str, &str)] = &[
 const ABOUT: &str = "Three panes: repositories, the object tree of one ref, and a \
 detail/preview pane. Selecting a repository opens its default branch; → expands it to pick \
 another branch or tag. In the tree → and ← open and close directories, → on a file zooms its \
-preview, and at a pane's edge they move focus instead. / in the tree searches recursively, \
+preview full-screen, where long lines wrap; the side pane lets them overflow. At a pane's edge → \
+and ← move focus instead. / in the tree searches recursively, \
 walking into closed directories and opening the path to every match; Esc restores the shape \
 you had open. Set ui.mouse = false to hand the mouse back to your terminal.";
 

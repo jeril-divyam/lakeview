@@ -159,6 +159,9 @@ selection, set `mouse = false` under `[ui]` and everything stays keyboard-driven
 - Directories are fetched one level at a time, as you open them.
 - Text previews are capped at `preview_bytes`; binary content falls back to a
   hex dump.
+- The zoomed preview wraps long lines, hanging continuations under the content
+  so the line numbers stay readable. The side pane lets them overflow instead —
+  at that width, wrapping one long JSON string would bury the rest of the file.
 - JSON is re-indented and syntax-coloured, preserving the file's key order. A
   file too large to fetch whole won't parse, so it renders as plain text.
 - Everything is read-only — lakeview never writes to your lakeFS server.

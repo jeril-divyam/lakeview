@@ -9,6 +9,8 @@ use ratatui::widgets::{
     Block, BorderType, Borders, HighlightSpacing, List, ListItem, Padding, Paragraph, Wrap,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use super::{format_ts, human_size, justify, truncate};
 use crate::app::{App, Focus, Load, Mode, PreviewBody, ReposRow, ReposView, RowKind, TreeView};
 use crate::theme::Theme;
@@ -355,14 +357,127 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, zoomed: bool) -> Rect {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = match app.focus {
+    let mut lines = match app.focus {
         Focus::Repos => repos_detail(app),
         Focus::Tree => tree_detail(app, inner.width),
     };
 
+    // Only zoom re-flows. In the side pane a long JSON string would cost a
+    // dozen lines to show whole, burying the rest of the file; at full width
+    // wrapping is what you want, since nothing else is competing for the room.
+    if zoomed {
+        lines = lines
+            .into_iter()
+            .flat_map(|line| {
+                let indent = hanging_indent(&line);
+                wrap_line(line, inner.width as usize, indent)
+            })
+            .collect();
+    }
+
     let paragraph = Paragraph::new(Text::from(lines)).scroll((app.preview.scroll, 0));
     frame.render_widget(paragraph, inner);
     inner
+}
+
+/// Where a wrapped continuation should start: under the content, past the
+/// gutter or label prefixing the line, plus any indentation the content itself
+/// carries. A line that is a single span has no such prefix — a hex dump row,
+/// a bare path — so its continuations start at the margin.
+fn hanging_indent(line: &Line) -> usize {
+    if line.spans.len() < 2 {
+        return 0;
+    }
+    let prefix = line.spans[0].content.width();
+    let leading = line.spans[1..]
+        .iter()
+        .flat_map(|s| s.content.chars())
+        .take_while(|c| *c == ' ')
+        .count();
+    prefix + leading
+}
+
+/// Re-flow one line to `width`, indenting every line after the first by
+/// `indent`. Styles survive the break, so a wrapped JSON string keeps its
+/// colour. Words are kept whole where they fit; anything longer than the line
+/// on its own — a base64 blob, a long URL — is broken hard, since refusing to
+/// break it would just push it off the edge again.
+fn wrap_line(line: Line<'static>, width: usize, indent: usize) -> Vec<Line<'static>> {
+    let total: usize = line.spans.iter().map(|s| s.content.width()).sum();
+    if width < 8 || total <= width {
+        return vec![line];
+    }
+    // Never let the indent crowd out the text it is meant to align.
+    let indent = indent.min(width / 2);
+
+    let cells: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|span| {
+            let style = span.style;
+            span.content.chars().map(move |c| (c, style))
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < cells.len() {
+        let first = out.is_empty();
+        let room = if first { width } else { width - indent };
+
+        // Take as much as fits.
+        let mut end = start;
+        let mut used = 0;
+        while end < cells.len() {
+            let w = char_width(cells[end].0);
+            if used + w > room {
+                break;
+            }
+            used += w;
+            end += 1;
+        }
+        if end == cells.len() {
+            out.push(cells_to_line(&cells[start..end], if first { 0 } else { indent }));
+            break;
+        }
+
+        // Back off to the last space so words stay whole — but not so far back
+        // that most of the line goes to waste.
+        let mut brk = end;
+        if let Some(pos) = cells[start..end].iter().rposition(|(c, _)| *c == ' ')
+            && start + pos + 1 > start + room / 2
+        {
+            brk = start + pos + 1;
+        }
+        out.push(cells_to_line(&cells[start..brk], if first { 0 } else { indent }));
+
+        start = brk;
+        // A continuation shouldn't open with the space it broke on.
+        while start < cells.len() && cells[start].0 == ' ' {
+            start += 1;
+        }
+    }
+    out
+}
+
+fn char_width(c: char) -> usize {
+    UnicodeWidthStr::width(c.to_string().as_str())
+}
+
+/// Rebuild a line from styled cells, merging runs that share a style back into
+/// single spans so the frame isn't one span per character.
+fn cells_to_line(cells: &[(char, Style)], indent: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if indent > 0 {
+        spans.push(Span::raw(" ".repeat(indent)));
+    }
+    for (c, style) in cells {
+        match spans.last_mut() {
+            Some(prev) if prev.style == *style => prev.content.to_mut().push(*c),
+            _ => spans.push(Span::styled(c.to_string(), *style)),
+        }
+    }
+    Line::from(spans)
 }
 
 fn repos_detail(app: &App) -> Vec<Line<'static>> {
@@ -522,4 +637,93 @@ fn kv(key: &str, value: &str, style: Style) -> Line<'static> {
         Span::styled(format!("{key:<16}"), Theme::faint()),
         Span::styled(value.to_string(), style),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Flatten a rendered line back to plain text, for comparison.
+    fn text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn wrapped(line: Line<'static>, width: usize) -> Vec<String> {
+        let indent = hanging_indent(&line);
+        wrap_line(line, width, indent).iter().map(text).collect()
+    }
+
+    #[test]
+    fn short_lines_are_left_alone() {
+        let line = Line::from(vec![Span::raw(" 1 "), Span::raw("hello")]);
+        assert_eq!(wrapped(line, 40), vec![" 1 hello"]);
+    }
+
+    #[test]
+    fn continuations_hang_under_the_gutter() {
+        let line = Line::from(vec![Span::raw(" 1 "), Span::raw("alpha beta gamma delta")]);
+        let out = wrapped(line, 12);
+        assert_eq!(out[0], " 1 alpha ");
+        // Every line after the first starts under the content, not the gutter.
+        for cont in &out[1..] {
+            assert!(cont.starts_with("   "), "{cont:?} should be indented by 3");
+            assert!(!cont.starts_with("    "), "{cont:?} over-indented");
+        }
+        assert_eq!(out.concat().replace(' ', ""), "1alphabetagammadelta");
+    }
+
+    #[test]
+    fn a_word_longer_than_the_line_is_broken_hard() {
+        let long = "A".repeat(50);
+        let line = Line::from(vec![Span::raw("  9 "), Span::raw(long.clone())]);
+        let out = wrapped(line, 20);
+        assert!(out.len() > 2, "expected several lines, got {out:?}");
+        for l in &out {
+            assert!(l.width() <= 20, "{l:?} is wider than the pane");
+        }
+        assert_eq!(out.concat().replace(' ', ""), format!("9{long}"));
+    }
+
+    #[test]
+    fn json_nesting_is_part_of_the_indent() {
+        // gutter " 2 " plus the two-space nesting pad the JSON writer emits.
+        let line = Line::from(vec![
+            Span::raw(" 2 "),
+            Span::raw("  "),
+            Span::raw("\"k\": \"vvvvvvvvvvvvvvvvvvvvvvvvv\""),
+        ]);
+        assert_eq!(hanging_indent(&line), 5);
+        let out = wrapped(line, 16);
+        assert!(out[1].starts_with("     "), "{:?}", out[1]);
+    }
+
+    #[test]
+    fn styles_survive_the_break() {
+        let keyed = Style::new().fg(Theme::ACCENT);
+        let line = Line::from(vec![
+            Span::raw(" 1 "),
+            Span::styled("x".repeat(40), keyed),
+        ]);
+        let out = wrap_line(line, 20, 3);
+        assert!(out.len() > 1);
+        // The indent is unstyled; every cell carrying content keeps its colour.
+        for l in &out {
+            for span in l.spans.iter().filter(|s| s.content.contains('x')) {
+                assert_eq!(span.style, keyed);
+            }
+        }
+    }
+
+    #[test]
+    fn single_span_lines_have_no_hanging_indent() {
+        // A hex dump row or a bare path has no gutter to hang under.
+        let line = Line::raw("00000000  a9 38 e9 31  .8.1");
+        assert_eq!(hanging_indent(&line), 0);
+    }
+
+    #[test]
+    fn a_pane_too_narrow_to_wrap_is_left_alone() {
+        let line = Line::from(vec![Span::raw(" 1 "), Span::raw("something long")]);
+        assert_eq!(wrapped(line, 4).len(), 1);
+    }
 }
