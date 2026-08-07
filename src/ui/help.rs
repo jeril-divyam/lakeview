@@ -11,42 +11,35 @@ use crate::theme::Theme;
 const NAVIGATION: &[(&str, &str)] = &[
     ("j / ↓", "move down"),
     ("k / ↑", "move up"),
-    ("l / → / Enter", "open the selection"),
-    ("h / ← / Bksp", "close the rightmost column"),
+    ("l / → / Enter", "expand / step right"),
+    ("h / ← / Bksp", "collapse / step left"),
+    ("space", "expand / collapse in place"),
     ("g / G", "first / last entry"),
     ("Ctrl-d / Ctrl-u", "half-page down / up"),
 ];
 
 const ACTIONS: &[(&str, &str)] = &[
-    ("/", "filter the focused column"),
-    ("Esc", "clear the filter / leave zoom"),
+    ("/", "search the focused pane"),
+    ("Esc", "clear the search / leave zoom"),
     ("y", "copy the lakefs:// URI"),
-    ("r", "reload the focused column"),
+    ("r", "reload the focused pane"),
     ("p", "switch profile"),
     ("1 / 2 / 3", "jump to a tab"),
     ("Tab", "cycle tabs"),
     ("q / Ctrl-c", "quit"),
 ];
 
-const ABOUT: &[&str] = &[
-    "Columns open to the right as you descend:",
-    "repositories → refs → object prefixes.",
-    "Older columns collapse when space runs out;",
-    "‹ marks the ones scrolled off.",
-    "Opening a file zooms its preview full-screen.",
-    "A repo with one ref skips the branch column.",
-    "",
-    "Clicking an earlier column closes the ones to",
-    "its right. The wheel moves the selection in the",
-    "focused column, and only scrolls the view in the",
-    "earlier ones. Set ui.mouse = false to hand the",
-    "mouse back to your terminal.",
-];
+const ABOUT: &str = "Three panes: repositories, the object tree of one ref, and a \
+detail/preview pane. Selecting a repository opens its default branch; → expands it to pick \
+another branch or tag. In the tree → and ← open and close directories, → on a file zooms its \
+preview, and at a pane's edge they move focus instead. / in the tree searches recursively, \
+walking into closed directories and opening the path to every match; Esc restores the shape \
+you had open. Set ui.mouse = false to hand the mouse back to your terminal.";
 
 const MOUSE: &[(&str, &str)] = &[
-    ("click", "select the row"),
-    ("double-click", "open it"),
-    ("right-click", "close the rightmost column"),
+    ("click", "focus the pane, select the row"),
+    ("double-click", "expand / collapse, or open"),
+    ("right-click", "collapse / go back"),
     ("wheel", "scroll under the cursor"),
 ];
 
@@ -60,7 +53,7 @@ pub fn draw(frame: &mut Frame, area: Rect) {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
 
     let [nav, mouse, about] = Layout::vertical([
-        Constraint::Length(8),
+        Constraint::Length(9),
         Constraint::Length(6),
         Constraint::Min(3),
     ])
@@ -72,12 +65,10 @@ pub fn draw(frame: &mut Frame, area: Rect) {
     frame.render_widget(keys("Mouse", MOUSE, mouse.width), mouse);
     frame.render_widget(keys("Actions", ACTIONS, actions.width), actions);
 
-    let lines: Vec<Line> = ABOUT
-        .iter()
-        .map(|l| Line::styled(l.to_string(), Theme::dim()))
-        .collect();
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(panel("Layout")),
+        Paragraph::new(Text::styled(ABOUT, Theme::dim()))
+            .wrap(Wrap { trim: false })
+            .block(panel("Layout")),
         about,
     );
 

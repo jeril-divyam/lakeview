@@ -7,10 +7,11 @@
 default_profile = "local"
 
 [ui]
-column_width = 28       # min width of a Miller column before older ones collapse
+repos_width = 28        # width of the repositories pane
 preview_percent = 38    # share of the screen given to the preview pane (0 disables)
 preview_bytes = 65536   # max bytes fetched when previewing a file
 page_size = 500         # entries fetched per API request (lakeFS caps at 1000)
+search_max_requests = 300  # listings a recursive `/` search may spend
 show_tags = true        # list tags alongside branches
 mouse = true            # set false to restore terminal click-drag text selection
 

@@ -82,12 +82,13 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Right side: spinner, profile name and endpoint — dropped piecewise as
     // the terminal narrows so it never collides with the tabs.
-    let spinner_width = if app.inflight > 0 { 2 } else { 0 };
+    let busy = app.busy();
+    let spinner_width = if busy { 2 } else { 0 };
     let room = (inner.width as usize).saturating_sub(tabs_width + spinner_width + 1);
     let endpoint = app.profile.endpoint.trim_end_matches('/');
 
     let mut right = Vec::new();
-    if app.inflight > 0 {
+    if busy {
         right.push(Span::styled(
             format!("{} ", SPINNER[(app.tick / 2) % SPINNER.len()]),
             Theme::accent(),
@@ -131,10 +132,10 @@ fn draw_breadcrumb(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Filter indicator for the focused pane.
-    let filter = &app.focused().filter;
+    let filter = app.filter();
     if !filter.is_empty() || app.mode == Mode::Filter {
         spans.push(Span::styled("   filter: ", Theme::faint()));
-        spans.push(Span::styled(filter.clone(), Theme::accent()));
+        spans.push(Span::styled(filter.to_string(), Theme::accent()));
         if app.mode == Mode::Filter {
             spans.push(Span::styled("█", Theme::accent()));
         }
@@ -166,10 +167,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("↑↓/jk", "move"),
             ("→/l", "open"),
             ("←/h", "back"),
-            ("/", "filter"),
+            ("space", "toggle"),
+            ("/", "search"),
             ("y", "copy"),
             ("r", "reload"),
-            ("p", "profile"),
             ("q", "quit"),
         ],
         (Tab::Commits, _) => &[

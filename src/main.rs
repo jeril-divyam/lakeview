@@ -255,20 +255,12 @@ fn on_key_profiles(app: &mut App, key: KeyEvent, selected: usize) {
 }
 
 fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
-    // Any key other than "open" cancels a queued drill-down.
-    if !matches!(
-        key.code,
-        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter
-    ) {
-        app.pending_open = false;
-    }
-
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Esc => {
             if app.mode == Mode::Zoom {
                 app.mode = Mode::Normal;
-            } else if !app.focused().filter.is_empty() {
+            } else if !app.filter().is_empty() {
                 app.filter_clear();
             }
         }
@@ -290,6 +282,12 @@ fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
         KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
             if app.tab == Tab::Browse {
                 app.back();
+            }
+        }
+        // Expand or collapse in place, without moving focus.
+        KeyCode::Char(' ') => {
+            if app.tab == Tab::Browse && app.mode != Mode::Zoom {
+                app.toggle();
             }
         }
 

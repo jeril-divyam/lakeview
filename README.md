@@ -3,27 +3,28 @@
 A terminal browser for [lakeFS](https://lakefs.io), written in Rust with
 [ratatui](https://ratatui.rs).
 
-Columns open to the right as you descend — repositories → refs → object
-prefixes — with a live detail/preview pane pinned to the right edge.
+Three panes: repositories on the left, a tree of one ref's objects in the
+middle, and a live detail/preview pane pinned to the right edge.
 
 ```
 ╭────────────────────────────────────────────────────────────────────────────────╮
 │  1 Browse   2 Commits   3 Help                        mock · http://lakefs:8000│
 ╰────────────────────────────────────────────────────────────────────────────────╯
- lakefs://quickstart/main/data/curated
-╭‹ main ───────── 4 ╮╭ data ────────── 3 ╮╭ curated ──── 1 ╮╭ daily_rollup.json ╮
-│ ▸ data/           ││ ▸ curated/        ││▌  daily_ro… 56B││ size        56 B   │
-│ ▸ images/         ││ ▸ raw/            ││                ││ modified    10:59  │
-│   README.md  120 B││   lakes.pa… 2.05kB││                ││ type        json   │
-│   lakes.sou…  47 B││                   ││                ││ ─────────────────  │
-│                   ││                   ││                ││  1 {               │
-│                   ││                   ││                ││  2   "clicks": 2,  │
-╰───────────────────╯╰───────────────────╯╰────────────────╯╰────────────────────╯
-        ↑↓/jk  move   →/l  open   ←/h  back   /  filter   y  copy   q  quit
+ lakefs://quickstart/main/data/curated/daily_rollup.json
+╭ Repositories ─── 2 ╮╭ main ──────────────── 6 ╮╭ daily_rollup.json ──────────╮
+│ ▾ quickstart   main││ ▾ data/                 ││ size            56 B        │
+│     ● main  a3f01b2││   ▾ curated/            ││ modified        10:59       │
+│     ○ dev   77c19ee││    ▌  daily_ro…    56 B ││ type            json        │
+│     ◇ v1.0  1b2c3d4││   ▸ raw/                ││ ──────────────────────────  │
+│ ▸ analytics    main││ ▸ images/               ││  1 {                        │
+│                    ││   README.md       120 B ││  2   "clicks": 2,           │
+╰────────────────────╯╰─────────────────────────╯╰─────────────────────────────╯
+      ↑↓/jk move  →/l open  ←/h back  space toggle  / search  y copy  q quit
 ```
 
-A repository with only one ref skips the branch column entirely — there is
-nothing to choose, so opening it lands straight in the object listing.
+Selecting a repository opens its default branch straight away — the listing
+already names it, so nothing extra is fetched. Press `→` on a repository to
+expand it and pick another branch or tag.
 
 ## Install
 
@@ -50,10 +51,11 @@ between them at runtime with `p`.
 default_profile = "local"
 
 [ui]
-column_width = 28       # min width of a Miller column before older ones collapse
+repos_width = 28        # width of the repositories pane
 preview_percent = 38    # share of the screen given to the preview pane (0 disables)
 preview_bytes = 65536   # max bytes fetched when previewing a file
 page_size = 500         # entries fetched per API request
+search_max_requests = 300  # listings a recursive `/` search may spend
 show_tags = true        # list tags alongside branches
 mouse = true            # set false to restore terminal text selection
 
@@ -93,19 +95,34 @@ secrets need not be stored on disk. `lakeview init` writes the file with mode
 | Key | Action |
 |---|---|
 | `j` `k` / `↓` `↑` | move |
-| `l` `→` `Enter` | open — a file opens the zoomed preview |
-| `h` `←` `Backspace` | close the rightmost column |
+| `l` `→` `Enter` | expand; at a pane's edge, move focus right; on a file, zoom the preview |
+| `h` `←` `Backspace` | collapse, else go to the parent; at the top level, move focus left |
+| `space` | expand / collapse in place, without moving focus |
 | `g` / `G` | first / last entry |
 | `Ctrl-d` / `Ctrl-u` | half-page down / up |
-| `/` | filter the focused column (`Esc` clears) |
+| `/` | search the focused pane (`Esc` clears) |
 | `y` | copy the selected `lakefs://` URI (OSC 52, works over SSH) |
-| `r` | reload the focused column |
+| `r` | reload the focused pane |
 | `p` | switch profile |
 | `1` `2` `3` / `Tab` | switch tab |
 | `q` / `Ctrl-c` | quit |
 
-Pressing open on a column that is still loading is remembered and replayed once
-the data arrives, so fast drill-downs don't lose keystrokes.
+Reloading the tree with `r` keeps the directories you had open.
+
+## Search
+
+`/` in the repositories pane filters it by name. `/` in the tree searches
+**recursively**: it walks into closed directories and opens the path to every
+match, so a file buried three levels down is found without opening anything by
+hand. Directories already loaded match as you type; the walk over the rest
+starts once you stop typing.
+
+Clearing the search with `Esc` restores exactly the shape you had open — the
+search never touches your own expand/collapse state.
+
+A search stops after `search_max_requests` directory listings and says so
+rather than quietly returning a partial result. Nothing is fetched twice, so
+extending the search term costs nothing.
 
 ## Mouse
 
@@ -113,11 +130,11 @@ Mouse support is on by default.
 
 | Action | Effect |
 |---|---|
-| click a row | select it; clicking an earlier column closes the columns to its right |
-| double-click a row | open it |
-| right-click | close the rightmost column |
-| wheel over the focused column | move the selection (the preview follows) |
-| wheel over an earlier column | scroll that column's view only — no focus or selection change |
+| click a row | focus that pane and select the row |
+| double-click a row | expand / collapse it, or open it if there's nothing to expand |
+| right-click | collapse, or go back |
+| wheel over the focused pane | move the selection (the preview follows) |
+| wheel over the other pane | scroll that pane's view only — no focus or selection change |
 | wheel over the preview | scroll the preview |
 | click a tab | switch tab |
 
@@ -137,6 +154,7 @@ selection, set `mouse = false` under `[ui]` and everything stays keyboard-driven
 ## Notes
 
 - Listings are paginated transparently and sorted directories-first.
+- Directories are fetched one level at a time, as you open them.
 - Text previews are capped at `preview_bytes`; binary content falls back to a
   hex dump.
 - JSON is re-indented and syntax-coloured, preserving the file's key order. A

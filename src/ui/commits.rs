@@ -15,10 +15,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let [list_area, detail_area] =
         Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(area);
 
-    let (repo, reference) = app.context();
-    let title = match (repo, reference) {
-        (Some(r), Some(f)) => format!("{r} @ {f}"),
-        _ => "Commits".to_string(),
+    let title = match app.context() {
+        Some((repo, reference)) => format!("{repo} @ {reference}"),
+        None => "Commits".to_string(),
     };
 
     let block = Block::default()
@@ -36,11 +35,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(list_area);
     frame.render_widget(block, list_area);
     app.hits.commits = Some(inner);
-    app.hits.columns.clear();
+    app.hits.repos = None;
+    app.hits.tree = None;
     app.hits.preview = None;
 
     match &app.commits.load {
-        None => {
+        // `Idle` never reaches here — the commits view uses `None` for that.
+        None | Some(Load::Idle) => {
             frame.render_widget(
                 note("open a repository and ref in the Browse tab first"),
                 inner,

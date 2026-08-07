@@ -50,9 +50,10 @@ pub struct Profile {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UiConfig {
-    /// Minimum width of a Miller column before older columns get dropped.
-    #[serde(default = "default_column_width")]
-    pub column_width: u16,
+    /// Width of the repositories pane. `column_width` is accepted as an alias
+    /// so configs written for the old Miller-column layout still load.
+    #[serde(default = "default_repos_width", alias = "column_width")]
+    pub repos_width: u16,
     /// Percentage of the screen given to the preview pane (0 disables it).
     #[serde(default = "default_preview_pct")]
     pub preview_percent: u16,
@@ -62,7 +63,11 @@ pub struct UiConfig {
     /// Entries fetched per API page (lakeFS caps this at 1000).
     #[serde(default = "default_page_size")]
     pub page_size: u32,
-    /// Show tags alongside branches in the refs column.
+    /// Directory listings a recursive `/` search may spend before giving up.
+    /// Caps the work a single search can do on a wide tree.
+    #[serde(default = "default_search_budget")]
+    pub search_max_requests: usize,
+    /// Show tags alongside branches under an expanded repository.
     #[serde(default = "default_true")]
     pub show_tags: bool,
     /// Capture the mouse for scrolling and clicking. Turning this off restores
@@ -77,7 +82,7 @@ fn default_true() -> bool {
 fn default_timeout() -> u64 {
     30
 }
-fn default_column_width() -> u16 {
+fn default_repos_width() -> u16 {
     28
 }
 fn default_preview_pct() -> u16 {
@@ -89,14 +94,18 @@ fn default_preview_bytes() -> u64 {
 fn default_page_size() -> u32 {
     500
 }
+fn default_search_budget() -> usize {
+    300
+}
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            column_width: default_column_width(),
+            repos_width: default_repos_width(),
             preview_percent: default_preview_pct(),
             preview_bytes: default_preview_bytes(),
             page_size: default_page_size(),
+            search_max_requests: default_search_budget(),
             show_tags: true,
             mouse: true,
         }
@@ -189,10 +198,11 @@ pub const TEMPLATE: &str = r#"# lakeview configuration — https://docs.lakefs.i
 default_profile = "local"
 
 [ui]
-column_width = 28       # min width of a Miller column
+repos_width = 28        # width of the repositories pane
 preview_percent = 38    # share of the screen given to the preview pane
 preview_bytes = 65536   # max bytes fetched when previewing a file
 page_size = 500         # entries fetched per API request
+search_max_requests = 300  # listings a recursive `/` search may spend
 show_tags = true        # list tags alongside branches
 mouse = true            # set false to restore terminal text selection
 

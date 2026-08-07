@@ -1,12 +1,17 @@
 //! Application state and the update half of the loop.
 //!
-//! Navigation is a stack of panes (Miller columns): repositories → refs →
-//! object prefixes. Opening an entry pushes a pane on the right; going back
-//! pops it. All network work happens off-thread and reports back through
-//! `Msg`; every request carries a monotonic id so stale replies are dropped.
+//! The browser is three fixed panes: repositories (expandable to reveal their
+//! refs), a lazily-loaded tree of one ref's objects, and a detail/preview pane.
+//! All network work happens off-thread and reports back through `Msg`; pane-one
+//! requests carry a monotonic id and tree requests carry a generation, so stale
+//! replies are dropped rather than applied to the wrong thing.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc::UnboundedSender;
@@ -15,14 +20,41 @@ use crate::config::{Config, Profile};
 use crate::lakefs::{Client, Commit, NamedRef, ObjectStats, RefKind, Repository};
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
+/// How long the pane-one selection must settle before its ref's tree is
+/// fetched. Without this, holding `j` down the repository list would fire a
+/// root listing per row.
+const TARGET_DEBOUNCE: Duration = Duration::from_millis(120);
+/// How long the filter must sit still before a recursive search goes to the
+/// network. Marking already-loaded nodes is not debounced — that is instant.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const STATUS_TTL: Duration = Duration::from_secs(4);
+/// Directory listings a search has in flight at once.
+const CRAWL_CONCURRENCY: usize = 8;
+/// Arena slot of the tree's synthetic root. Its children are the top level.
+pub const ROOT: usize = 0;
 
 // ── messages from background tasks ───────────────────────────────────────
 
 pub enum Msg {
     Repos(u64, Result<Vec<Repository>, String>),
-    Refs(u64, Result<Vec<NamedRef>, String>),
-    Objects(u64, Result<Vec<ObjectStats>, String>),
+    Refs {
+        req: u64,
+        repo: String,
+        res: Result<Vec<NamedRef>, String>,
+    },
+    /// One directory level, fetched because the user expanded it.
+    Children {
+        generation: u64,
+        prefix: String,
+        res: Result<Vec<ObjectStats>, String>,
+    },
+    /// A level of the recursive search, several listings at a time.
+    Crawl {
+        generation: u64,
+        batch: Vec<(String, Result<Vec<ObjectStats>, String>)>,
+        capped: bool,
+        done: bool,
+    },
     Commits(u64, Result<Vec<Commit>, String>),
     Preview(u64, Result<PreviewPayload, String>),
 }
@@ -32,136 +64,128 @@ pub struct PreviewPayload {
     pub bytes: Vec<u8>,
 }
 
-// ── panes ────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Source {
-    Repos,
-    Refs {
-        repo: String,
-    },
-    Objects {
-        repo: String,
-        reference: String,
-        prefix: String,
-    },
-}
-
-pub enum Items {
-    None,
-    Repos(Vec<Repository>),
-    Refs(Vec<NamedRef>),
-    Objects(Vec<ObjectStats>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowKind {
-    Repo,
-    Branch,
-    Tag,
-    Dir,
-    File,
-}
-
-/// A render-ready line, cached so filtering isn't redone every frame.
-pub struct Row {
-    pub label: String,
-    pub meta: String,
-    pub kind: RowKind,
-    /// Highlights the repository's default branch.
-    pub primary: bool,
-    /// Index into the pane's unfiltered item list.
-    pub index: usize,
-}
+// ── shared bits ──────────────────────────────────────────────────────────
 
 pub enum Load {
+    /// Not requested yet — a collapsed directory that has never been opened.
+    Idle,
     Loading,
     Ready,
     Failed(String),
 }
 
-pub struct Pane {
-    pub source: Source,
-    pub items: Items,
-    pub rows: Vec<Row>,
-    pub state: ListState,
+/// What a pane-one row stands for. The tree pane renders straight from its
+/// `Node`s, so directories and files need no variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    Repo,
+    Branch,
+    Tag,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Repos,
+    Tree,
+}
+
+fn move_in(state: &mut ListState, len: usize, delta: isize) {
+    if len == 0 {
+        state.select(None);
+        return;
+    }
+    let current = state.selected().unwrap_or(0) as isize;
+    let next = (current + delta).clamp(0, len as isize - 1) as usize;
+    state.select(Some(next));
+}
+
+// ── pane 1: repositories, expandable to their refs ───────────────────────
+
+pub struct RefsSlot {
     pub load: Load,
-    pub filter: String,
-    /// Id of the most recent request; replies with a different id are stale.
+    pub refs: Vec<NamedRef>,
     pub req: u64,
 }
 
-impl Pane {
-    fn new(source: Source, req: u64) -> Self {
-        Self {
-            source,
-            items: Items::None,
-            rows: Vec::new(),
-            state: ListState::default(),
-            load: Load::Loading,
-            filter: String::new(),
-            req,
-        }
-    }
+/// A render-ready line, cached so filtering isn't redone every frame.
+pub struct ReposRow {
+    pub label: String,
+    pub meta: String,
+    pub kind: RowKind,
+    /// Highlights the repository's default branch.
+    pub primary: bool,
+    pub repo: String,
+    /// `Some` on ref rows, `None` on repository rows.
+    pub reference: Option<String>,
+    pub expanded: bool,
+    /// A repository row whose refs are still in flight.
+    pub loading: bool,
+}
 
-    pub fn title(&self) -> String {
-        match &self.source {
-            Source::Repos => "Repositories".into(),
-            Source::Refs { repo } => repo.clone(),
-            Source::Objects {
-                reference, prefix, ..
-            } => {
-                if prefix.is_empty() {
-                    reference.clone()
-                } else {
-                    prefix
-                        .trim_end_matches('/')
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(prefix)
-                        .into()
-                }
-            }
-        }
-    }
+#[derive(Default)]
+pub struct ReposView {
+    pub repos: Vec<Repository>,
+    pub refs: HashMap<String, RefsSlot>,
+    pub expanded: HashSet<String>,
+    pub rows: Vec<ReposRow>,
+    pub state: ListState,
+    pub filter: String,
+    pub req: u64,
+}
 
-    pub fn selected_row(&self) -> Option<&Row> {
+impl ReposView {
+    pub fn selected_row(&self) -> Option<&ReposRow> {
         self.state.selected().and_then(|i| self.rows.get(i))
     }
 
-    pub fn selected_object(&self) -> Option<&ObjectStats> {
+    /// The (repo, ref) pair the current row points at. A ref row names its own
+    /// ref; a repository row stands in for its default branch, which the
+    /// repository listing already carries.
+    pub fn selected_target(&self) -> Option<(String, String)> {
         let row = self.selected_row()?;
-        match &self.items {
-            Items::Objects(v) => v.get(row.index),
-            _ => None,
+        if let Some(reference) = &row.reference {
+            return Some((row.repo.clone(), reference.clone()));
         }
+        let repo = self.repos.iter().find(|r| r.id == row.repo)?;
+        (!repo.default_branch.is_empty())
+            .then(|| (repo.id.clone(), repo.default_branch.clone()))
     }
 
-    /// Recompute the visible rows, preserving the selected item where possible.
+    /// Identity of the selected row, used to hold the selection across rebuilds.
+    fn selected_key(&self) -> Option<(String, Option<String>)> {
+        self.selected_row()
+            .map(|r| (r.repo.clone(), r.reference.clone()))
+    }
+
+    /// Recompute the visible rows, preserving the selection where possible.
     fn rebuild(&mut self) {
-        let previous = self.selected_row().map(|r| r.label.clone());
+        let previous = self.selected_key();
         let needle = self.filter.to_lowercase();
         let matches = |s: &str| needle.is_empty() || s.to_lowercase().contains(&needle);
 
-        self.rows = match &self.items {
-            Items::None => Vec::new(),
-            Items::Repos(v) => v
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| matches(&r.id))
-                .map(|(i, r)| Row {
-                    label: r.id.clone(),
-                    meta: r.default_branch.clone(),
-                    kind: RowKind::Repo,
-                    primary: false,
-                    index: i,
-                })
-                .collect(),
-            Items::Refs(v) => v
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| matches(&r.id))
-                .map(|(i, r)| Row {
+        let mut rows = Vec::new();
+        for repo in &self.repos {
+            if !matches(&repo.id) {
+                continue;
+            }
+            let expanded = self.expanded.contains(&repo.id);
+            let slot = self.refs.get(&repo.id);
+            rows.push(ReposRow {
+                label: repo.id.clone(),
+                meta: repo.default_branch.clone(),
+                kind: RowKind::Repo,
+                primary: false,
+                repo: repo.id.clone(),
+                reference: None,
+                expanded,
+                loading: matches!(slot.map(|s| &s.load), Some(Load::Loading)),
+            });
+            if !expanded {
+                continue;
+            }
+            let Some(slot) = slot else { continue };
+            for r in &slot.refs {
+                rows.push(ReposRow {
                     label: r.id.clone(),
                     meta: r.commit_id.chars().take(8).collect(),
                     kind: match r.kind {
@@ -169,32 +193,244 @@ impl Pane {
                         RefKind::Tag => RowKind::Tag,
                     },
                     primary: r.is_default,
-                    index: i,
-                })
-                .collect(),
-            Items::Objects(v) => v
-                .iter()
-                .enumerate()
-                .filter(|(_, o)| matches(o.name()))
-                .map(|(i, o)| Row {
-                    label: o.name().to_string(),
-                    meta: if o.is_dir() {
-                        String::new()
-                    } else {
-                        crate::ui::human_size(o.size_bytes.unwrap_or(0))
-                    },
-                    kind: if o.is_dir() {
-                        RowKind::Dir
-                    } else {
-                        RowKind::File
-                    },
-                    primary: false,
-                    index: i,
-                })
-                .collect(),
-        };
+                    repo: repo.id.clone(),
+                    reference: Some(r.id.clone()),
+                    expanded: false,
+                    loading: false,
+                });
+            }
+        }
+        self.rows = rows;
 
-        let restored = previous.and_then(|label| self.rows.iter().position(|r| r.label == label));
+        let restored = previous.and_then(|(repo, reference)| {
+            self.rows
+                .iter()
+                .position(|r| r.repo == repo && r.reference == reference)
+                // The row we were on may have vanished with its parent; fall
+                // back to the repository it belonged to.
+                .or_else(|| self.rows.iter().position(|r| r.repo == repo))
+        });
+        self.state.select(match restored {
+            Some(i) => Some(i),
+            None if self.rows.is_empty() => None,
+            None => Some(0),
+        });
+    }
+}
+
+// ── pane 2: the object tree ──────────────────────────────────────────────
+
+pub struct Node {
+    pub stat: ObjectStats,
+    pub name: String,
+    pub depth: usize,
+    pub parent: Option<usize>,
+    /// Empty until this directory's listing lands.
+    pub children: Vec<usize>,
+    pub load: Load,
+    /// The user's own expand/collapse toggle. A search never touches it, so
+    /// clearing the filter restores exactly the shape they had open.
+    pub expanded: bool,
+    /// Set by the filter pass: this node or one of its descendants matches.
+    pub matched: bool,
+}
+
+impl Node {
+    pub fn is_dir(&self) -> bool {
+        self.stat.is_dir()
+    }
+}
+
+pub struct TreeView {
+    /// (repo, ref) this tree belongs to.
+    pub key: Option<(String, String)>,
+    /// Arena. `nodes[ROOT]` is synthetic and stands for the ref's top level.
+    pub nodes: Vec<Node>,
+    /// path -> arena slot, for routing replies back to the right node.
+    pub index: HashMap<String, usize>,
+    /// Flattened visible slots.
+    pub rows: Vec<usize>,
+    pub state: ListState,
+    pub filter: String,
+    /// Set when the filter changed; the network crawl fires once it settles.
+    pub filter_dirty: Option<Instant>,
+    /// Bumped on repo/ref switch and reload; stale replies are dropped.
+    pub generation: u64,
+    pub crawling: bool,
+    pub capped: bool,
+}
+
+impl Default for TreeView {
+    fn default() -> Self {
+        let mut tree = Self {
+            key: None,
+            nodes: Vec::new(),
+            index: HashMap::new(),
+            rows: Vec::new(),
+            state: ListState::default(),
+            filter: String::new(),
+            filter_dirty: None,
+            generation: 0,
+            crawling: false,
+            capped: false,
+        };
+        tree.clear_arena();
+        tree
+    }
+}
+
+impl TreeView {
+    fn clear_arena(&mut self) {
+        self.nodes = vec![Node {
+            stat: ObjectStats {
+                path: String::new(),
+                path_type: "common_prefix".into(),
+                physical_address: String::new(),
+                checksum: String::new(),
+                size_bytes: None,
+                mtime: 0,
+                content_type: None,
+            },
+            name: String::new(),
+            depth: 0,
+            parent: None,
+            children: Vec::new(),
+            load: Load::Idle,
+            expanded: true,
+            matched: false,
+        }];
+        self.index = HashMap::from([(String::new(), ROOT)]);
+        self.rows.clear();
+        self.state = ListState::default();
+        self.capped = false;
+        self.crawling = false;
+    }
+
+    /// Point the tree at a new ref, discarding everything loaded for the old
+    /// one. Bumps the generation so in-flight replies are ignored.
+    fn retarget(&mut self, key: Option<(String, String)>) {
+        self.generation += 1;
+        self.key = key;
+        self.clear_arena();
+    }
+
+    pub fn root_load(&self) -> &Load {
+        &self.nodes[ROOT].load
+    }
+
+    pub fn selected_slot(&self) -> Option<usize> {
+        self.state.selected().and_then(|i| self.rows.get(i)).copied()
+    }
+
+    pub fn selected(&self) -> Option<&Node> {
+        self.selected_slot().map(|slot| &self.nodes[slot])
+    }
+
+    fn selected_path(&self) -> Option<String> {
+        self.selected().map(|n| n.stat.path.clone())
+    }
+
+    fn select_slot(&mut self, slot: usize) {
+        if let Some(row) = self.rows.iter().position(|s| *s == slot) {
+            self.state.select(Some(row));
+        }
+    }
+
+    /// Whether this directory's children are currently shown beneath it.
+    pub fn is_open(&self, slot: usize) -> bool {
+        let node = &self.nodes[slot];
+        if !node.is_dir() || node.children.is_empty() {
+            return false;
+        }
+        if self.filter.is_empty() {
+            node.expanded
+        } else {
+            // Under a filter the shape is driven by matches, and a directory
+            // matched only by its own name has nothing shown beneath it.
+            node.children.iter().any(|c| self.nodes[*c].matched)
+        }
+    }
+
+    /// Attach a freshly-listed level to `slot`. Pure arena mutation — callers
+    /// re-mark and rebuild once, after applying a whole batch.
+    fn insert_children(&mut self, slot: usize, entries: Vec<ObjectStats>) {
+        let depth = if slot == ROOT {
+            0
+        } else {
+            self.nodes[slot].depth + 1
+        };
+        let mut children = Vec::with_capacity(entries.len());
+        for stat in entries {
+            // A level can be listed twice — an expand racing the search crawl.
+            // Reuse the existing node so its subtree and toggle survive.
+            if let Some(&existing) = self.index.get(&stat.path) {
+                children.push(existing);
+                continue;
+            }
+            let name = stat.name().to_string();
+            let path = stat.path.clone();
+            let is_dir = stat.is_dir();
+            self.nodes.push(Node {
+                stat,
+                name,
+                depth,
+                parent: Some(slot),
+                children: Vec::new(),
+                load: if is_dir { Load::Idle } else { Load::Ready },
+                expanded: false,
+                matched: false,
+            });
+            let new = self.nodes.len() - 1;
+            self.index.insert(path, new);
+            children.push(new);
+        }
+        self.nodes[slot].children = children;
+        self.nodes[slot].load = Load::Ready;
+    }
+
+    /// Bottom-up match pass. Children always sit at a higher arena index than
+    /// their parent, so one reverse sweep resolves the whole tree.
+    fn mark_matches(&mut self) {
+        let needle = self.filter.to_lowercase();
+        if needle.is_empty() {
+            for node in &mut self.nodes {
+                node.matched = false;
+            }
+            return;
+        }
+        for slot in (0..self.nodes.len()).rev() {
+            let node = &self.nodes[slot];
+            let own = !node.name.is_empty() && node.name.to_lowercase().contains(&needle);
+            let descendant = node.children.iter().any(|c| self.nodes[*c].matched);
+            self.nodes[slot].matched = own || descendant;
+        }
+    }
+
+    /// Flatten the arena into visible rows, depth-first.
+    fn rebuild_rows(&mut self) {
+        let previous = self.selected_path();
+        let filtering = !self.filter.is_empty();
+
+        let mut rows = Vec::new();
+        let mut stack: Vec<usize> = self.nodes[ROOT].children.iter().rev().copied().collect();
+        while let Some(slot) = stack.pop() {
+            let node = &self.nodes[slot];
+            if filtering && !node.matched {
+                continue;
+            }
+            rows.push(slot);
+            let descend = if filtering { node.matched } else { node.expanded };
+            if node.is_dir() && descend {
+                stack.extend(node.children.iter().rev().copied());
+            }
+        }
+        self.rows = rows;
+
+        let restored = previous.and_then(|path| {
+            self.index
+                .get(&path)
+                .and_then(|slot| self.rows.iter().position(|s| s == slot))
+        });
         self.state.select(match restored {
             Some(i) => Some(i),
             None if self.rows.is_empty() => None,
@@ -202,20 +438,20 @@ impl Pane {
         });
     }
 
-    fn set_items(&mut self, items: Items) {
-        self.items = items;
-        self.load = Load::Ready;
-        self.rebuild();
+    /// Directories a search still needs to fetch. Excludes those already
+    /// loaded, in flight, or known to have failed, so nothing is fetched twice
+    /// and a broken directory isn't retried in a loop.
+    fn unloaded_dirs(&self) -> Vec<String> {
+        self.nodes
+            .iter()
+            .filter(|n| n.is_dir() && matches!(n.load, Load::Idle))
+            .map(|n| n.stat.path.clone())
+            .collect()
     }
 
-    fn move_by(&mut self, delta: isize) {
-        if self.rows.is_empty() {
-            return;
-        }
-        let last = self.rows.len() - 1;
-        let current = self.state.selected().unwrap_or(0) as isize;
-        let next = (current + delta).clamp(0, last as isize) as usize;
-        self.state.select(Some(next));
+    /// Objects discovered so far, not counting the synthetic root.
+    pub fn discovered(&self) -> usize {
+        self.nodes.len() - 1
     }
 }
 
@@ -310,8 +546,10 @@ pub struct Status {
 /// mapped back to what was drawn there.
 #[derive(Default)]
 pub struct Hits {
-    /// (pane index, inner list area) for each column currently on screen.
-    pub columns: Vec<(usize, Rect)>,
+    /// Inner area of the repositories pane.
+    pub repos: Option<Rect>,
+    /// Inner area of the tree pane.
+    pub tree: Option<Rect>,
     /// Inner area of the detail/preview pane.
     pub preview: Option<Rect>,
     /// Inner area of the commit list.
@@ -340,7 +578,9 @@ pub struct App {
     pub client: Client,
     pub tx: UnboundedSender<Msg>,
 
-    pub panes: Vec<Pane>,
+    pub repos: ReposView,
+    pub tree: TreeView,
+    pub focus: Focus,
     pub tab: Tab,
     pub mode: Mode,
     pub commits: CommitsView,
@@ -351,9 +591,15 @@ pub struct App {
     next_req: u64,
     pub inflight: usize,
     pub tick: usize,
-    /// Set when `open` is pressed on a column that is still loading; replayed
-    /// once the data lands so fast drill-downs don't lose keystrokes.
-    pub pending_open: bool,
+    /// Shared with the search crawler so a new search, a cleared filter or a
+    /// change of ref actually stops the old one rather than just ignoring it.
+    crawl_token: Arc<AtomicU64>,
+    /// A `--repo`/`--ref` jump waiting for the repository list to arrive.
+    pending_jump: Option<(String, Option<String>)>,
+    /// Directories a reload should re-open, applied as each level lands.
+    pending_expand: Vec<String>,
+    /// Set when the pane-one selection moved; the tree follows once it settles.
+    target_dirty: Option<Instant>,
     /// Regions recorded by the last render, for mouse hit-testing.
     pub hits: Hits,
     /// Cell and time of the last click, used to detect double-clicks.
@@ -374,7 +620,9 @@ impl App {
             profile,
             client,
             tx,
-            panes: Vec::new(),
+            repos: ReposView::default(),
+            tree: TreeView::default(),
+            focus: Focus::Repos,
             tab: Tab::Browse,
             mode: Mode::Normal,
             commits: CommitsView::default(),
@@ -384,11 +632,14 @@ impl App {
             next_req: 0,
             inflight: 0,
             tick: 0,
-            pending_open: false,
+            crawl_token: Arc::new(AtomicU64::new(0)),
+            pending_jump: None,
+            pending_expand: Vec::new(),
+            target_dirty: None,
             hits: Hits::default(),
             last_click: None,
         };
-        app.reset_to_repos();
+        app.load_repos();
         app
     }
 
@@ -405,138 +656,196 @@ impl App {
         });
     }
 
-    pub fn focused(&self) -> &Pane {
-        self.panes.last().expect("at least one pane")
+    /// Anything on the wire, for the header spinner.
+    pub fn busy(&self) -> bool {
+        self.inflight > 0 || self.tree.crawling
     }
 
-    fn focused_mut(&mut self) -> &mut Pane {
-        self.panes.last_mut().expect("at least one pane")
-    }
-
-    /// The repo/ref the user is currently inside, if any.
-    pub fn context(&self) -> (Option<&str>, Option<&str>) {
-        let mut repo = None;
-        let mut reference = None;
-        for pane in &self.panes {
-            match &pane.source {
-                Source::Repos => {}
-                Source::Refs { repo: r } => repo = Some(r.as_str()),
-                Source::Objects {
-                    repo: r,
-                    reference: f,
-                    ..
-                } => {
-                    repo = Some(r.as_str());
-                    reference = Some(f.as_str());
-                }
-            }
-        }
-        (repo, reference)
+    /// The repo/ref the tree is showing, if any.
+    pub fn context(&self) -> Option<(&str, &str)> {
+        self.tree
+            .key
+            .as_ref()
+            .map(|(repo, reference)| (repo.as_str(), reference.as_str()))
     }
 
     pub fn breadcrumb(&self) -> Vec<String> {
         let mut parts = Vec::new();
-        if let Some(pane) = self.panes.last() {
-            match &pane.source {
-                Source::Repos => {}
-                Source::Refs { repo } => parts.push(repo.clone()),
-                Source::Objects {
-                    repo,
-                    reference,
-                    prefix,
-                } => {
-                    parts.push(repo.clone());
-                    parts.push(reference.clone());
-                    parts.extend(
-                        prefix
-                            .trim_end_matches('/')
-                            .split('/')
-                            .filter(|s| !s.is_empty())
-                            .map(String::from),
-                    );
-                }
-            }
+        let Some((repo, reference)) = &self.tree.key else {
+            return parts;
+        };
+        parts.push(repo.clone());
+        parts.push(reference.clone());
+        if self.focus == Focus::Tree
+            && let Some(node) = self.tree.selected()
+        {
+            parts.extend(
+                node.stat
+                    .path
+                    .trim_end_matches('/')
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+            );
         }
         parts
     }
 
+    /// The filter belonging to whichever pane has focus.
+    pub fn filter(&self) -> &str {
+        match self.focus {
+            Focus::Repos => &self.repos.filter,
+            Focus::Tree => &self.tree.filter,
+        }
+    }
+
     // ── loading ──────────────────────────────────────────────────────────
 
-    pub fn reset_to_repos(&mut self) {
+    pub fn load_repos(&mut self) {
         let req = self.req_id();
-        self.panes = vec![Pane::new(Source::Repos, req)];
-        self.spawn_load(0);
-    }
-
-    /// Jump straight to `repo` (and optionally `reference`), building the
-    /// intermediate columns so the user can still walk back up.
-    pub fn open_path(&mut self, repo: &str, reference: Option<&str>) {
-        // `spawn_load` assigns each pane its real request id below.
-        let mut sources = vec![
-            Source::Repos,
-            Source::Refs {
-                repo: repo.to_string(),
-            },
-        ];
-        if let Some(reference) = reference {
-            sources.push(Source::Objects {
-                repo: repo.to_string(),
-                reference: reference.to_string(),
-                prefix: String::new(),
-            });
-        }
-
-        self.panes = sources.into_iter().map(|s| Pane::new(s, 0)).collect();
-        for idx in 0..self.panes.len() {
-            self.spawn_load(idx);
-        }
-    }
-
-    /// Kick off the fetch backing pane `idx`.
-    fn spawn_load(&mut self, idx: usize) {
-        let req = self.req_id();
-        let (source, tx, client) = {
-            let pane = &mut self.panes[idx];
-            pane.req = req;
-            pane.load = Load::Loading;
-            (pane.source.clone(), self.tx.clone(), self.client.clone())
-        };
-        let show_tags = self.cfg.ui.show_tags;
+        self.repos.req = req;
         self.inflight += 1;
-
+        let (tx, client) = (self.tx.clone(), self.client.clone());
         tokio::spawn(async move {
-            let msg = match source {
-                Source::Repos => Msg::Repos(req, client.repositories().await.map_err(fmt_err)),
-                Source::Refs { repo } => {
-                    Msg::Refs(req, client.refs(&repo, show_tags).await.map_err(fmt_err))
-                }
-                Source::Objects {
-                    repo,
-                    reference,
-                    prefix,
-                } => Msg::Objects(
-                    req,
-                    client
-                        .list_objects(&repo, &reference, &prefix)
-                        .await
-                        .map_err(fmt_err),
-                ),
-            };
-            let _ = tx.send(msg);
+            let res = client.repositories().await.map_err(fmt_err);
+            let _ = tx.send(Msg::Repos(req, res));
         });
     }
 
-    pub fn reload_focused(&mut self) {
-        let idx = self.panes.len() - 1;
-        self.spawn_load(idx);
-        self.preview.key = None;
+    fn load_refs(&mut self, repo: &str) {
+        let req = self.req_id();
+        self.repos.refs.insert(
+            repo.to_string(),
+            RefsSlot {
+                load: Load::Loading,
+                refs: Vec::new(),
+                req,
+            },
+        );
+        self.inflight += 1;
+        let show_tags = self.cfg.ui.show_tags;
+        let (tx, client, repo) = (self.tx.clone(), self.client.clone(), repo.to_string());
+        tokio::spawn(async move {
+            let res = client.refs(&repo, show_tags).await.map_err(fmt_err);
+            let _ = tx.send(Msg::Refs { req, repo, res });
+        });
+    }
+
+    /// Fetch one directory level into `slot`.
+    fn load_children(&mut self, slot: usize) {
+        let Some((repo, reference)) = self.tree.key.clone() else {
+            return;
+        };
+        let prefix = self.tree.nodes[slot].stat.path.clone();
+        self.tree.nodes[slot].load = Load::Loading;
+        let generation = self.tree.generation;
+        self.inflight += 1;
+        let (tx, client) = (self.tx.clone(), self.client.clone());
+        tokio::spawn(async move {
+            let res = client
+                .list_objects(&repo, &reference, &prefix)
+                .await
+                .map_err(fmt_err);
+            let _ = tx.send(Msg::Children {
+                generation,
+                prefix,
+                res,
+            });
+        });
+    }
+
+    /// Point the tree at `(repo, reference)` and start loading its top level.
+    fn set_target(&mut self, target: Option<(String, String)>) {
+        if self.tree.key == target {
+            return;
+        }
+        self.tree.retarget(target);
+        self.bump_crawl();
+        self.clear_preview();
+        if self.tree.key.is_some() {
+            self.load_children(ROOT);
+            // Carry an active search over to the new ref.
+            if !self.tree.filter.is_empty() {
+                self.tree.filter_dirty = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Note that the tree should follow the pane-one selection. The move is
+    /// debounced, so running down the repository list costs one fetch, not one
+    /// per row.
+    fn sync_target(&mut self) {
+        self.target_dirty = Some(Instant::now());
+    }
+
+    /// Called on every tick: moves the tree to the selected repo/ref.
+    fn poll_target(&mut self) {
+        let Some(since) = self.target_dirty else {
+            return;
+        };
+        if since.elapsed() < TARGET_DEBOUNCE {
+            return;
+        }
+        self.target_dirty = None;
+
+        let target = self.repos.selected_target();
+        if self.tree.key == target {
+            return;
+        }
+        // A repository row stands for its default branch, but only when you
+        // are not already inside that repository. Otherwise collapsing it — or
+        // just moving up onto its row — would yank the tree off the ref you
+        // were reading. Picking a ref row explicitly always moves the tree.
+        let on_repo_row = self
+            .repos
+            .selected_row()
+            .is_some_and(|r| r.reference.is_none());
+        if on_repo_row
+            && let (Some((selected, _)), Some((showing, _))) = (&target, &self.tree.key)
+            && selected == showing
+        {
+            return;
+        }
+
+        self.set_target(target);
+        // `set_target` resets the preview, so re-arm it.
         self.mark_preview_dirty();
-        self.set_status("reloading…", false);
+    }
+
+    pub fn reload_focused(&mut self) {
+        match self.focus {
+            Focus::Repos => {
+                self.repos.refs.clear();
+                self.load_repos();
+                self.set_status("reloading repositories…", false);
+            }
+            Focus::Tree => {
+                let Some(key) = self.tree.key.clone() else {
+                    return;
+                };
+                // Keep the shape the user had open across the reload.
+                let open: Vec<String> = self
+                    .tree
+                    .nodes
+                    .iter()
+                    .filter(|n| n.expanded && n.is_dir() && n.parent.is_some())
+                    .map(|n| n.stat.path.clone())
+                    .collect();
+                self.tree.retarget(Some(key));
+                self.pending_expand = open;
+                self.bump_crawl();
+                self.load_children(ROOT);
+                self.clear_preview();
+                if !self.tree.filter.is_empty() {
+                    self.tree.filter_dirty = Some(Instant::now());
+                }
+                self.set_status("reloading…", false);
+            }
+        }
     }
 
     pub fn load_commits(&mut self, force: bool) {
-        let (repo, reference) = self.context();
-        let (Some(repo), Some(reference)) = (repo.map(String::from), reference.map(String::from))
+        let Some((repo, reference)) = self.context().map(|(r, f)| (r.to_string(), f.to_string()))
         else {
             return;
         };
@@ -573,13 +882,17 @@ impl App {
         }
         self.preview.dirty_since = None;
 
-        let (repo, reference) = self.context();
-        let (Some(repo), Some(reference)) = (repo.map(String::from), reference.map(String::from))
+        let Some((repo, reference)) = self.context().map(|(r, f)| (r.to_string(), f.to_string()))
         else {
             self.clear_preview();
             return;
         };
-        let Some(object) = self.focused().selected_object().cloned() else {
+        // Only the tree selects objects; pane one renders its own details.
+        let object = match self.focus {
+            Focus::Repos => None,
+            Focus::Tree => self.tree.selected().map(|n| n.stat.clone()),
+        };
+        let Some(object) = object else {
             self.clear_preview();
             return;
         };
@@ -634,16 +947,224 @@ impl App {
         self.preview = Preview::default();
     }
 
+    // ── recursive search ─────────────────────────────────────────────────
+
+    /// Invalidate any crawl in flight. The task checks this between levels.
+    fn bump_crawl(&mut self) -> u64 {
+        self.tree.crawling = false;
+        self.crawl_token.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Called on every tick: starts the debounced network crawl.
+    fn poll_search(&mut self) {
+        let Some(since) = self.tree.filter_dirty else {
+            return;
+        };
+        if since.elapsed() < SEARCH_DEBOUNCE {
+            return;
+        }
+        self.tree.filter_dirty = None;
+        if self.tree.filter.is_empty() || self.tree.key.is_none() {
+            return;
+        }
+        self.start_crawl();
+    }
+
+    /// Walk every directory the tree hasn't loaded yet, so a filter can match
+    /// things inside collapsed directories. Loaded levels are never re-fetched,
+    /// so extending the filter string costs nothing.
+    fn start_crawl(&mut self) {
+        let Some((repo, reference)) = self.tree.key.clone() else {
+            return;
+        };
+        let token = self.bump_crawl();
+        let seed = self.tree.unloaded_dirs();
+        if seed.is_empty() {
+            return;
+        }
+
+        self.tree.crawling = true;
+        self.tree.capped = false;
+        let generation = self.tree.generation;
+        let budget = self.cfg.ui.search_max_requests.max(1);
+        let shared = self.crawl_token.clone();
+        let (tx, client) = (self.tx.clone(), self.client.clone());
+
+        tokio::spawn(async move {
+            let mut frontier = seed;
+            let mut remaining = budget;
+            loop {
+                // A newer search, a cleared filter or a change of ref wins.
+                if shared.load(Ordering::Relaxed) != token {
+                    return;
+                }
+                if frontier.is_empty() || remaining == 0 {
+                    let _ = tx.send(Msg::Crawl {
+                        generation,
+                        batch: Vec::new(),
+                        capped: !frontier.is_empty(),
+                        done: true,
+                    });
+                    return;
+                }
+
+                let take = frontier.len().min(remaining);
+                let level: Vec<String> = frontier.drain(..take).collect();
+                remaining -= take;
+
+                let batch: Vec<(String, Result<Vec<ObjectStats>, String>)> =
+                    futures::stream::iter(level)
+                        .map(|prefix| {
+                            let client = client.clone();
+                            let (repo, reference) = (repo.clone(), reference.clone());
+                            async move {
+                                let res = client
+                                    .list_objects(&repo, &reference, &prefix)
+                                    .await
+                                    .map_err(fmt_err);
+                                (prefix, res)
+                            }
+                        })
+                        .buffer_unordered(CRAWL_CONCURRENCY)
+                        .collect()
+                        .await;
+
+                // Every directory found here is new — its parent was unloaded,
+                // so none of these nodes existed before.
+                for (_, res) in &batch {
+                    if let Ok(entries) = res {
+                        frontier.extend(
+                            entries
+                                .iter()
+                                .filter(|e| e.is_dir())
+                                .map(|e| e.path.clone()),
+                        );
+                    }
+                }
+
+                if tx
+                    .send(Msg::Crawl {
+                        generation,
+                        batch,
+                        capped: false,
+                        done: false,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+
     // ── message handling ─────────────────────────────────────────────────
 
     pub fn on_msg(&mut self, msg: Msg) {
-        self.inflight = self.inflight.saturating_sub(1);
         match msg {
-            Msg::Repos(req, res) => self.apply_pane(req, res.map(Items::Repos)),
-            Msg::Refs(req, res) => self.apply_pane(req, res.map(Items::Refs)),
-            Msg::Objects(req, res) => self.apply_pane(req, res.map(Items::Objects)),
+            Msg::Repos(req, res) => {
+                self.inflight = self.inflight.saturating_sub(1);
+                if self.repos.req != req {
+                    return;
+                }
+                match res {
+                    Ok(repos) => {
+                        self.repos.repos = repos;
+                        // Drop expansions for repositories that are gone, and
+                        // re-fetch the refs of those a reload left open.
+                        let live: HashSet<String> =
+                            self.repos.repos.iter().map(|r| r.id.clone()).collect();
+                        self.repos.expanded.retain(|id| live.contains(id));
+                        let stale: Vec<String> = self
+                            .repos
+                            .expanded
+                            .iter()
+                            .filter(|id| !self.repos.refs.contains_key(*id))
+                            .cloned()
+                            .collect();
+                        for repo in stale {
+                            self.load_refs(&repo);
+                        }
+                        self.repos.rebuild();
+                        self.apply_jump();
+                        self.sync_target();
+                        self.mark_preview_dirty();
+                    }
+                    Err(e) => {
+                        self.repos.repos.clear();
+                        self.repos.rebuild();
+                        self.set_status(e, true);
+                    }
+                }
+            }
+
+            Msg::Refs { req, repo, res } => {
+                self.inflight = self.inflight.saturating_sub(1);
+                if self.repos.refs.get(&repo).map(|s| s.req) != Some(req) {
+                    return;
+                }
+                match res {
+                    Ok(refs) => {
+                        if let Some(slot) = self.repos.refs.get_mut(&repo) {
+                            slot.refs = refs;
+                            slot.load = Load::Ready;
+                        }
+                        self.repos.rebuild();
+                        self.apply_jump_ref(&repo);
+                    }
+                    Err(e) => {
+                        if let Some(slot) = self.repos.refs.get_mut(&repo) {
+                            slot.load = Load::Failed(e.clone());
+                        }
+                        self.repos.expanded.remove(&repo);
+                        self.repos.rebuild();
+                        self.set_status(e, true);
+                    }
+                }
+            }
+
+            Msg::Children {
+                generation,
+                prefix,
+                res,
+            } => {
+                self.inflight = self.inflight.saturating_sub(1);
+                if generation != self.tree.generation {
+                    return;
+                }
+                let Some(&slot) = self.tree.index.get(&prefix) else {
+                    return;
+                };
+                match res {
+                    Ok(entries) => {
+                        self.tree.insert_children(slot, entries);
+                        self.apply_pending_expand();
+                        self.tree.mark_matches();
+                        self.tree.rebuild_rows();
+                        if slot == ROOT && self.focus == Focus::Tree {
+                            self.mark_preview_dirty();
+                        }
+                        // Newly revealed directories may hide search matches.
+                        if !self.tree.filter.is_empty() {
+                            self.tree.filter_dirty = Some(Instant::now());
+                        }
+                    }
+                    Err(e) => {
+                        self.tree.nodes[slot].load = Load::Failed(e.clone());
+                        self.tree.rebuild_rows();
+                        self.set_status(e, true);
+                    }
+                }
+            }
+
+            Msg::Crawl {
+                generation,
+                batch,
+                capped,
+                done,
+            } => self.apply_crawl(generation, batch, capped, done),
 
             Msg::Commits(req, res) => {
+                self.inflight = self.inflight.saturating_sub(1);
                 if self.commits.req != req {
                     return;
                 }
@@ -664,6 +1185,7 @@ impl App {
             }
 
             Msg::Preview(req, res) => {
+                self.inflight = self.inflight.saturating_sub(1);
                 if self.preview.req != req {
                     return;
                 }
@@ -679,101 +1201,120 @@ impl App {
         }
     }
 
-    fn apply_pane(&mut self, req: u64, res: Result<Items, String>) {
-        let Some(idx) = self.panes.iter().position(|p| p.req == req) else {
-            return; // pane was popped while the request was in flight
-        };
-        match res {
-            Ok(items) => {
-                self.panes[idx].set_items(items);
-                // A repo with a single ref offers no choice, so that column
-                // drops out and its replacement is already loading.
-                if self.collapse_single_ref(idx) {
-                    return;
-                }
-                // An ancestor column should highlight the entry we came through.
-                self.sync_selection(idx);
-                self.mark_preview_dirty();
-                // Replay an `open` that was pressed while this column loaded.
-                if self.pending_open && idx == self.panes.len() - 1 {
-                    self.pending_open = false;
-                    self.open();
-                }
+    fn apply_crawl(
+        &mut self,
+        generation: u64,
+        batch: Vec<(String, Result<Vec<ObjectStats>, String>)>,
+        capped: bool,
+        done: bool,
+    ) {
+        if generation != self.tree.generation {
+            return;
+        }
+        for (prefix, res) in batch {
+            let Some(&slot) = self.tree.index.get(&prefix) else {
+                continue;
+            };
+            match res {
+                Ok(entries) => self.tree.insert_children(slot, entries),
+                Err(e) => self.tree.nodes[slot].load = Load::Failed(e),
             }
-            Err(e) => {
-                self.pending_open = false;
-                self.panes[idx].load = Load::Failed(e.clone());
-                self.set_status(e, true);
+        }
+        self.tree.mark_matches();
+        self.tree.rebuild_rows();
+
+        // Say nothing if the user has moved on from the search.
+        if self.tree.filter.is_empty() {
+            self.tree.crawling = !done;
+            return;
+        }
+        let found = self.tree.discovered();
+        if done {
+            self.tree.crawling = false;
+            self.tree.capped = capped;
+            if capped {
+                self.set_status(
+                    format!(
+                        "search stopped after {} listings — narrow the filter or open a subdirectory",
+                        self.cfg.ui.search_max_requests.max(1)
+                    ),
+                    true,
+                );
+            } else {
+                self.set_status(format!("searched {found} objects"), false);
             }
+        } else {
+            self.set_status(format!("searching… {found} objects"), false);
         }
     }
 
-    /// A refs column holding exactly one ref is pure ceremony — there is
-    /// nothing to pick — so drop it and go straight to the object listing.
-    /// Returns true when the column was removed.
-    fn collapse_single_ref(&mut self, idx: usize) -> bool {
-        let Items::Refs(refs) = &self.panes[idx].items else {
-            return false;
-        };
-        let Source::Refs { repo } = &self.panes[idx].source else {
-            return false;
-        };
-        let [only] = refs.as_slice() else {
-            return false;
-        };
-        let (repo, reference) = (repo.clone(), only.id.clone());
-
-        let was_last = idx + 1 == self.panes.len();
-        self.panes.remove(idx);
-
-        if was_last {
-            // Descend in its place. If the column had a child (a --repo/--ref
-            // jump), that child already covers the listing.
-            self.panes.insert(
-                idx,
-                Pane::new(
-                    Source::Objects {
-                        repo,
-                        reference,
-                        prefix: String::new(),
-                    },
-                    0,
-                ),
-            );
-            self.spawn_load(idx);
-            self.clear_preview();
-        }
-        true
-    }
-
-    /// Point pane `idx` at whichever row leads to pane `idx + 1`.
-    fn sync_selection(&mut self, idx: usize) {
-        let Some(child) = self.panes.get(idx + 1) else {
+    /// Select the repository named by `--repo`, expanding it when a `--ref` was
+    /// given too so the ref row can be selected once its listing lands.
+    fn apply_jump(&mut self) {
+        let Some((repo, reference)) = self.pending_jump.clone() else {
             return;
         };
-        // What the parent lists decides which part of the child identifies it.
-        let wanted = match (&self.panes[idx].source, &child.source) {
-            (Source::Repos, Source::Refs { repo }) => repo.clone(),
-            // No refs column in between: this repo had a single ref.
-            (Source::Repos, Source::Objects { repo, .. }) => repo.clone(),
-            (Source::Refs { .. }, Source::Objects { reference, .. }) => reference.clone(),
-            (Source::Objects { .. }, Source::Objects { prefix, .. }) => prefix
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or(prefix)
-                .to_string(),
-            _ => return,
+        let Some(row) = self.repos.rows.iter().position(|r| r.repo == repo) else {
+            self.pending_jump = None;
+            self.set_status(format!("repository `{repo}` not found"), true);
+            return;
         };
-        let pane = &mut self.panes[idx];
-        if let Some(pos) = pane.rows.iter().position(|r| r.label == wanted) {
-            pane.state.select(Some(pos));
+        self.repos.state.select(Some(row));
+        match reference {
+            Some(_) => self.expand_repo(&repo),
+            None => self.pending_jump = None,
         }
+    }
+
+    fn apply_jump_ref(&mut self, repo: &str) {
+        let Some((wanted_repo, Some(reference))) = self.pending_jump.clone() else {
+            return;
+        };
+        if wanted_repo != repo {
+            return;
+        }
+        self.pending_jump = None;
+        match self
+            .repos
+            .rows
+            .iter()
+            .position(|r| r.repo == repo && r.reference.as_deref() == Some(reference.as_str()))
+        {
+            Some(row) => {
+                self.repos.state.select(Some(row));
+                self.sync_target();
+            }
+            None => self.set_status(format!("ref `{reference}` not found in `{repo}`"), true),
+        }
+    }
+
+    /// Re-open the directories a reload was asked to preserve. A path deeper
+    /// than the level that just landed isn't in the arena yet, so it stays on
+    /// the list and is retried when its own parent arrives.
+    fn apply_pending_expand(&mut self) {
+        if self.pending_expand.is_empty() {
+            return;
+        }
+        let mut waiting = Vec::new();
+        for path in std::mem::take(&mut self.pending_expand) {
+            let Some(&slot) = self.tree.index.get(&path) else {
+                waiting.push(path);
+                continue;
+            };
+            self.tree.nodes[slot].expanded = true;
+            if matches!(self.tree.nodes[slot].load, Load::Idle) {
+                self.load_children(slot);
+            }
+        }
+        self.pending_expand = waiting;
     }
 
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        // Before the preview, so it sees the ref the tree has settled on.
+        self.poll_target();
         self.poll_preview();
+        self.poll_search();
         if let Some(status) = &self.status
             && status.at.elapsed() > STATUS_TTL
         {
@@ -786,13 +1327,8 @@ impl App {
     pub fn move_selection(&mut self, delta: isize) {
         match self.tab {
             Tab::Commits => {
-                if self.commits.commits.is_empty() {
-                    return;
-                }
-                let last = self.commits.commits.len() - 1;
-                let current = self.commits.state.selected().unwrap_or(0) as isize;
-                let next = (current + delta).clamp(0, last as isize) as usize;
-                self.commits.state.select(Some(next));
+                let len = self.commits.commits.len();
+                move_in(&mut self.commits.state, len, delta);
             }
             _ if self.mode == Mode::Zoom => {
                 self.preview.scroll = self
@@ -800,121 +1336,197 @@ impl App {
                     .scroll
                     .saturating_add_signed(delta.clamp(-1000, 1000) as i16);
             }
-            _ => {
-                self.focused_mut().move_by(delta);
-                self.mark_preview_dirty();
-            }
+            _ => match self.focus {
+                Focus::Repos => {
+                    let len = self.repos.rows.len();
+                    move_in(&mut self.repos.state, len, delta);
+                    self.sync_target();
+                    self.mark_preview_dirty();
+                }
+                Focus::Tree => {
+                    let len = self.tree.rows.len();
+                    move_in(&mut self.tree.state, len, delta);
+                    self.mark_preview_dirty();
+                }
+            },
         }
     }
 
     pub fn select_edge(&mut self, first: bool) {
-        match self.tab {
-            Tab::Commits => {
-                let len = self.commits.commits.len();
-                if len > 0 {
-                    self.commits
-                        .state
-                        .select(Some(if first { 0 } else { len - 1 }));
-                }
+        let (state, len) = match self.tab {
+            Tab::Commits => (&mut self.commits.state, self.commits.commits.len()),
+            _ => match self.focus {
+                Focus::Repos => (&mut self.repos.state, self.repos.rows.len()),
+                Focus::Tree => (&mut self.tree.state, self.tree.rows.len()),
+            },
+        };
+        if len > 0 {
+            state.select(Some(if first { 0 } else { len - 1 }));
+        }
+        if self.tab != Tab::Commits {
+            if self.focus == Focus::Repos {
+                self.sync_target();
             }
-            _ => {
-                let pane = self.focused_mut();
-                if !pane.rows.is_empty() {
-                    let idx = if first { 0 } else { pane.rows.len() - 1 };
-                    pane.state.select(Some(idx));
-                }
-                self.mark_preview_dirty();
-            }
+            self.mark_preview_dirty();
         }
     }
 
-    /// Descend into the selected entry, opening a new pane on the right.
+    fn expand_repo(&mut self, repo: &str) {
+        self.repos.expanded.insert(repo.to_string());
+        let needs_fetch = !matches!(
+            self.repos.refs.get(repo).map(|s| &s.load),
+            Some(Load::Ready) | Some(Load::Loading)
+        );
+        if needs_fetch {
+            self.load_refs(repo);
+        }
+        self.repos.rebuild();
+    }
+
+    fn collapse_repo(&mut self, repo: &str) {
+        self.repos.expanded.remove(repo);
+        self.repos.rebuild();
+        // Land on the repository row the refs belonged to.
+        if let Some(row) = self
+            .repos
+            .rows
+            .iter()
+            .position(|r| r.repo == repo && r.reference.is_none())
+        {
+            self.repos.state.select(Some(row));
+            self.sync_target();
+        }
+    }
+
+    /// `→` — descend: expand a repository or directory, move focus at the pane
+    /// edges, zoom a file.
     pub fn open(&mut self) {
-        // Nothing to open yet — remember the intent and replay it on arrival.
-        if matches!(self.focused().load, Load::Loading) {
-            self.pending_open = true;
-            return;
-        }
-        let Some(row) = self.focused().selected_row() else {
-            return;
-        };
-        let index = row.index;
-
-        let next = match (&self.focused().source, &self.focused().items) {
-            (Source::Repos, Items::Repos(v)) => {
-                v.get(index).map(|r| Source::Refs { repo: r.id.clone() })
-            }
-            (Source::Refs { repo }, Items::Refs(v)) => v.get(index).map(|r| Source::Objects {
-                repo: repo.clone(),
-                reference: r.id.clone(),
-                prefix: String::new(),
-            }),
-            (
-                Source::Objects {
-                    repo, reference, ..
-                },
-                Items::Objects(v),
-            ) => {
-                match v.get(index) {
-                    Some(o) if o.is_dir() => Some(Source::Objects {
-                        repo: repo.clone(),
-                        reference: reference.clone(),
-                        prefix: o.path.clone(),
-                    }),
-                    // A file has nothing to descend into — zoom the preview.
-                    Some(_) => {
-                        self.mode = Mode::Zoom;
-                        self.preview.scroll = 0;
-                        None
-                    }
-                    None => None,
+        match self.focus {
+            Focus::Repos => {
+                let Some(row) = self.repos.selected_row() else {
+                    return;
+                };
+                let (repo, is_ref, expanded) =
+                    (row.repo.clone(), row.reference.is_some(), row.expanded);
+                if is_ref || expanded {
+                    // Nothing further to open in pane one — step into the tree.
+                    self.focus = Focus::Tree;
+                    self.mark_preview_dirty();
+                } else {
+                    self.expand_repo(&repo);
                 }
             }
-            _ => None,
-        };
-
-        if let Some(source) = next {
-            let req = self.req_id();
-            self.panes.push(Pane::new(source, req));
-            let idx = self.panes.len() - 1;
-            self.spawn_load(idx);
-            self.clear_preview();
+            Focus::Tree => {
+                let Some(slot) = self.tree.selected_slot() else {
+                    return;
+                };
+                if !self.tree.nodes[slot].is_dir() {
+                    self.mode = Mode::Zoom;
+                    self.preview.scroll = 0;
+                    return;
+                }
+                self.tree.nodes[slot].expanded = true;
+                match self.tree.nodes[slot].load {
+                    // Retry a directory whose listing failed.
+                    Load::Idle | Load::Failed(_) => self.load_children(slot),
+                    Load::Loading => {}
+                    Load::Ready => self.tree.rebuild_rows(),
+                }
+            }
         }
     }
 
-    /// Pop the rightmost pane.
+    /// `←` — ascend: collapse, step to the parent, or move focus left.
     pub fn back(&mut self) {
         if self.mode == Mode::Zoom {
             self.mode = Mode::Normal;
             return;
         }
-        if self.panes.len() > 1 {
-            self.panes.pop();
-            self.clear_preview();
-            self.mark_preview_dirty();
+        match self.focus {
+            Focus::Repos => {
+                let Some(row) = self.repos.selected_row() else {
+                    return;
+                };
+                let repo = row.repo.clone();
+                if row.reference.is_some() || row.expanded {
+                    self.collapse_repo(&repo);
+                }
+            }
+            Focus::Tree => {
+                let Some(slot) = self.tree.selected_slot() else {
+                    self.focus = Focus::Repos;
+                    self.mark_preview_dirty();
+                    return;
+                };
+                let node = &self.tree.nodes[slot];
+                if node.is_dir() && node.expanded && self.tree.filter.is_empty() {
+                    self.tree.nodes[slot].expanded = false;
+                    self.tree.rebuild_rows();
+                    return;
+                }
+                match node.parent.filter(|p| *p != ROOT) {
+                    Some(parent) => {
+                        self.tree.select_slot(parent);
+                        self.mark_preview_dirty();
+                    }
+                    None => {
+                        self.focus = Focus::Repos;
+                        self.mark_preview_dirty();
+                    }
+                }
+            }
+        }
+    }
+
+    /// `space` — expand or collapse in place, without moving focus.
+    pub fn toggle(&mut self) {
+        match self.focus {
+            Focus::Repos => {
+                let Some(row) = self.repos.selected_row() else {
+                    return;
+                };
+                let (repo, expanded) = (row.repo.clone(), row.expanded);
+                if row.reference.is_some() {
+                    return;
+                }
+                if expanded {
+                    self.collapse_repo(&repo);
+                } else {
+                    self.expand_repo(&repo);
+                }
+            }
+            Focus::Tree => {
+                let Some(slot) = self.tree.selected_slot() else {
+                    return;
+                };
+                if !self.tree.nodes[slot].is_dir() {
+                    return;
+                }
+                if self.tree.nodes[slot].expanded {
+                    self.tree.nodes[slot].expanded = false;
+                    self.tree.rebuild_rows();
+                } else {
+                    self.open();
+                }
+            }
         }
     }
 
     /// Absolute path of the current selection, for the `y` (copy) action.
     pub fn selection_uri(&self) -> Option<String> {
-        let pane = self.focused();
-        let row = pane.selected_row()?;
-        match (&pane.source, &pane.items) {
-            (Source::Repos, Items::Repos(v)) => {
-                v.get(row.index).map(|r| format!("lakefs://{}", r.id))
+        match self.focus {
+            Focus::Repos => {
+                let row = self.repos.selected_row()?;
+                Some(match &row.reference {
+                    Some(reference) => format!("lakefs://{}/{}", row.repo, reference),
+                    None => format!("lakefs://{}", row.repo),
+                })
             }
-            (Source::Refs { repo }, Items::Refs(v)) => v
-                .get(row.index)
-                .map(|r| format!("lakefs://{}/{}", repo, r.id)),
-            (
-                Source::Objects {
-                    repo, reference, ..
-                },
-                Items::Objects(v),
-            ) => v
-                .get(row.index)
-                .map(|o| format!("lakefs://{}/{}/{}", repo, reference, o.path)),
-            _ => None,
+            Focus::Tree => {
+                let (repo, reference) = self.tree.key.as_ref()?;
+                let node = self.tree.selected()?;
+                Some(format!("lakefs://{}/{}/{}", repo, reference, node.stat.path))
+            }
         }
     }
 
@@ -923,8 +1535,7 @@ impl App {
     pub fn select_tab(&mut self, tab: Tab) {
         self.tab = tab;
         if tab == Tab::Commits {
-            let (repo, reference) = self.context();
-            if repo.is_none() || reference.is_none() {
+            if self.context().is_none() {
                 self.set_status("open a repository and ref in Browse first", false);
             }
             self.load_commits(false);
@@ -933,16 +1544,28 @@ impl App {
 
     // ── mouse ────────────────────────────────────────────────────────────
 
-    /// Map a screen cell inside a column to (pane index, row index).
-    fn column_at(&self, col: u16, row: u16) -> Option<(usize, usize)> {
-        let (idx, area) = self
-            .hits
-            .columns
-            .iter()
-            .find(|(_, area)| Hits::hit(*area, col, row))?;
-        let pane = self.panes.get(*idx)?;
-        let line = pane.state.offset() + (row - area.y) as usize;
-        (line < pane.rows.len()).then_some((*idx, line))
+    /// Which pane a screen cell belongs to, with its inner area.
+    fn pane_at(&self, col: u16, row: u16) -> Option<(Focus, Rect)> {
+        if let Some(area) = self.hits.repos
+            && Hits::hit(area, col, row)
+        {
+            return Some((Focus::Repos, area));
+        }
+        if let Some(area) = self.hits.tree
+            && Hits::hit(area, col, row)
+        {
+            return Some((Focus::Tree, area));
+        }
+        None
+    }
+
+    fn row_at(&self, focus: Focus, area: Rect, row: u16) -> Option<usize> {
+        let (state, len) = match focus {
+            Focus::Repos => (&self.repos.state, self.repos.rows.len()),
+            Focus::Tree => (&self.tree.state, self.tree.rows.len()),
+        };
+        let line = state.offset() + (row - area.y) as usize;
+        (line < len).then_some(line)
     }
 
     pub fn mouse_scroll(&mut self, col: u16, row: u16, down: bool) {
@@ -969,27 +1592,23 @@ impl App {
             return;
         }
 
-        let Some((idx, area)) = self
-            .hits
-            .columns
-            .iter()
-            .find(|(_, area)| Hits::hit(*area, col, row))
-            .map(|(i, a)| (*i, *a))
-        else {
+        let Some((focus, area)) = self.pane_at(col, row) else {
             return;
         };
 
-        if idx == self.panes.len() - 1 {
-            // The focused column tracks the wheel like j/k, so the preview
-            // follows along.
+        if focus == self.focus {
+            // The focused pane tracks the wheel like j/k, so the preview follows.
             self.move_selection(delta);
         } else {
-            // An ancestor just peeks: scroll the view, leave the selection and
-            // the pane stack alone. Stop once the last row is on screen, so a
+            // The other pane just peeks: scroll the view, leave the selection
+            // and the focus alone. Stop once the last row is on screen, so a
             // list shorter than its viewport doesn't scroll at all.
-            let pane = &mut self.panes[idx];
-            let max = pane.rows.len().saturating_sub(area.height as usize);
-            let offset = pane.state.offset_mut();
+            let (state, len) = match focus {
+                Focus::Repos => (&mut self.repos.state, self.repos.rows.len()),
+                Focus::Tree => (&mut self.tree.state, self.tree.rows.len()),
+            };
+            let max = len.saturating_sub(area.height as usize);
+            let offset = state.offset_mut();
             *offset = if down {
                 (*offset + WHEEL_LINES).min(max)
             } else {
@@ -998,11 +1617,8 @@ impl App {
         }
     }
 
-    /// Left click: select, or open when it's a double-click. Clicking into an
-    /// ancestor column closes the columns to its right, like a file browser.
+    /// Left click: focus the pane and select, or open on a double-click.
     pub fn mouse_click(&mut self, col: u16, row: u16) {
-        self.pending_open = false;
-
         if let Some(tab) = self
             .hits
             .tabs
@@ -1034,47 +1650,93 @@ impl App {
             return;
         }
 
-        let Some((idx, line)) = self.column_at(col, row) else {
+        let Some((focus, area)) = self.pane_at(col, row) else {
+            return;
+        };
+        let Some(line) = self.row_at(focus, area, row) else {
             return;
         };
 
-        // Focus the clicked column by dropping everything to its right.
-        if idx + 1 < self.panes.len() {
-            self.panes.truncate(idx + 1);
-            self.clear_preview();
+        self.focus = focus;
+        match focus {
+            Focus::Repos => {
+                self.repos.state.select(Some(line));
+                self.sync_target();
+            }
+            Focus::Tree => self.tree.state.select(Some(line)),
         }
-        self.panes[idx].state.select(Some(line));
         self.mark_preview_dirty();
 
         if double {
-            self.open();
+            // A container toggles, so the same gesture closes what it opened;
+            // anything else opens — a ref steps right, a file zooms.
+            let expandable = match self.focus {
+                Focus::Repos => self
+                    .repos
+                    .selected_row()
+                    .is_some_and(|r| r.reference.is_none()),
+                Focus::Tree => self.tree.selected().is_some_and(|n| n.is_dir()),
+            };
+            if expandable {
+                self.toggle();
+            } else {
+                self.open();
+            }
         }
     }
 
-    /// Right click mirrors `h`: close the rightmost column.
+    /// Right click mirrors `h`.
     pub fn mouse_back(&mut self) {
-        self.pending_open = false;
         self.back();
     }
 
     // ── filter ───────────────────────────────────────────────────────────
 
-    pub fn filter_push(&mut self, c: char) {
-        self.focused_mut().filter.push(c);
-        self.focused_mut().rebuild();
+    fn refilter(&mut self) {
+        match self.focus {
+            Focus::Repos => {
+                self.repos.rebuild();
+                self.sync_target();
+            }
+            Focus::Tree => {
+                // Re-mark immediately so already-loaded nodes respond to every
+                // keystroke; only the network crawl waits for a pause.
+                self.tree.mark_matches();
+                self.tree.rebuild_rows();
+                if self.tree.filter.is_empty() {
+                    self.tree.filter_dirty = None;
+                    self.tree.capped = false;
+                    self.bump_crawl();
+                } else {
+                    self.tree.filter_dirty = Some(Instant::now());
+                }
+            }
+        }
         self.mark_preview_dirty();
+    }
+
+    pub fn filter_push(&mut self, c: char) {
+        match self.focus {
+            Focus::Repos => self.repos.filter.push(c),
+            Focus::Tree => self.tree.filter.push(c),
+        }
+        self.refilter();
     }
 
     pub fn filter_pop(&mut self) {
-        self.focused_mut().filter.pop();
-        self.focused_mut().rebuild();
-        self.mark_preview_dirty();
+        match self.focus {
+            Focus::Repos => self.repos.filter.pop(),
+            Focus::Tree => self.tree.filter.pop(),
+        };
+        self.refilter();
     }
 
     pub fn filter_clear(&mut self) {
-        self.focused_mut().filter.clear();
-        self.focused_mut().rebuild();
-        self.mark_preview_dirty();
+        match self.focus {
+            Focus::Repos => self.repos.filter.clear(),
+            Focus::Tree => self.tree.filter.clear(),
+        }
+        self.refilter();
     }
 
     // ── profiles ─────────────────────────────────────────────────────────
@@ -1093,11 +1755,25 @@ impl App {
                 self.profile = profile;
                 self.profile_name = name.to_string();
                 self.commits = CommitsView::default();
-                self.clear_preview();
-                self.reset_to_repos();
+                self.repos = ReposView::default();
+                self.focus = Focus::Repos;
+                self.pending_jump = None;
+                self.pending_expand.clear();
+                self.set_target(None);
+                self.load_repos();
                 self.set_status(format!("switched to profile `{name}`"), false);
             }
             Err(e) => self.set_status(format!("{name}: {e}"), true),
+        }
+    }
+
+    /// Jump straight to `repo` (and optionally `reference`) on start-up. The
+    /// tree loads at once; pane one catches up when the repository list lands.
+    pub fn open_path(&mut self, repo: &str, reference: Option<&str>) {
+        self.pending_jump = Some((repo.to_string(), reference.map(String::from)));
+        if let Some(reference) = reference {
+            self.set_target(Some((repo.to_string(), reference.to_string())));
+            self.focus = Focus::Tree;
         }
     }
 }
