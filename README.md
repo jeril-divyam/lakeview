@@ -11,13 +11,13 @@ configurable ratio.
 ╭────────────────────────────────────────────────────────────────────────────────╮
 │  1 Browse   2 Commits   3 Help                        mock · http://lakefs:8000│
 ╰────────────────────────────────────────────────────────────────────────────────╯
- lakefs://quickstart/main/data/curated/daily_rollup.json
 ╭ Repositories ─── 2 ╮╭ main ──────────────── 6 ╮╭ daily_rollup.json ──────────╮
+│                    ││                         ││                             │
 │ ▾ quickstart   main││ ▾ data/                 ││ size            56 B        │
 │     ● main  a3f01b2││   ▾ curated/            ││ modified        10:59       │
 │     ○ dev   77c19ee││    ▌  daily_ro…    56 B ││ type            json        │
 │     ◇ v1.0  1b2c3d4││   ▸ raw/                ││ ──────────────────────────  │
-│ ▸ analytics    main││ ▸ images/               ││  1 {                        │
+│ ● analytics    main││ ▸ images/               ││  1 {                        │
 │                    ││   README.md       120 B ││  2   "clicks": 2,           │
 ╰────────────────────╯╰─────────────────────────╯╰─────────────────────────────╯
       ↑↓/jk move  →/l open  ←/h back  space toggle  / search  y copy  q quit
@@ -26,6 +26,12 @@ configurable ratio.
 Selecting a repository opens its default branch straight away — the listing
 already names it, so nothing extra is fetched. Press `→` on a repository to
 expand it and pick another branch or tag.
+
+A repository with one branch never lists it: its row already selects it, so a
+row of its own would only add a step. Such a repository is marked `●` — the same
+mark its lone default branch would have worn a row below — rather than `▸`, and
+`→` steps straight into the tree. Tags are always listed, so a single-branch
+repository that has them still expands.
 
 ## Install
 

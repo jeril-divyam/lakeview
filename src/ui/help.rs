@@ -113,7 +113,7 @@ fn panel(title: &str) -> Block<'static> {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Theme::border(false))
-        .padding(Padding::horizontal(1))
+        .padding(Padding::new(1, 1, 1, 0))
         .title_top(Line::from(vec![
             Span::raw(" "),
             Span::styled(title.to_string(), Theme::title(false)),

@@ -24,6 +24,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Theme::border(true))
+        .padding(Padding::top(1))
         .title_top(Line::from(vec![
             Span::raw(" "),
             Span::styled(
@@ -61,7 +62,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 Paragraph::new(Text::from(err.as_str()))
                     .style(Theme::error())
                     .wrap(Wrap { trim: true })
-                    .block(Block::default().padding(Padding::uniform(1))),
+                    .block(Block::default().padding(Padding::horizontal(1))),
                 inner,
             );
         }
@@ -108,7 +109,7 @@ fn draw_commit_detail(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Theme::border(false))
-        .padding(Padding::horizontal(1))
+        .padding(Padding::new(1, 1, 1, 0))
         .title_top(Line::from(vec![
             Span::raw(" "),
             Span::styled("Commit", Theme::title(false)),
@@ -171,8 +172,7 @@ fn kv(key: &str, value: &str) -> Line<'static> {
     ])
 }
 
+/// The pane's own top padding sets these off from the border already.
 fn note(text: &str) -> Paragraph<'static> {
-    Paragraph::new(Line::styled(text.to_string(), Theme::faint()))
-        .centered()
-        .block(Block::default().padding(Padding::top(1)))
+    Paragraph::new(Line::styled(text.to_string(), Theme::faint())).centered()
 }

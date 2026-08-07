@@ -30,6 +30,8 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const STATUS_TTL: Duration = Duration::from_secs(4);
 /// Directory listings a search has in flight at once.
 const CRAWL_CONCURRENCY: usize = 8;
+/// Repositories whose refs are probed at once on start-up.
+const PROBE_CONCURRENCY: usize = 8;
 /// Arena slot of the tree's synthetic root. Its children are the top level.
 pub const ROOT: usize = 0;
 
@@ -41,6 +43,14 @@ pub enum Msg {
         req: u64,
         repo: String,
         res: Result<Vec<NamedRef>, String>,
+    },
+    /// Whether a repository has refs worth listing, answered without fetching
+    /// them all. Carries the repository listing's id so a reload's answers
+    /// can't land on a newer list.
+    RefProbe {
+        req: u64,
+        repo: String,
+        listable: bool,
     },
     /// One directory level, fetched because the user expanded it.
     Children {
@@ -107,6 +117,30 @@ pub struct RefsSlot {
     pub req: u64,
 }
 
+impl RefsSlot {
+    /// Refs worth listing under the repository. A repository with a single
+    /// branch leaves it out: the repository row already stands for its default
+    /// branch, so a row of its own would only add a step. Tags are always
+    /// listed, and a lone branch that isn't the recognised default stays —
+    /// nothing else would reach it.
+    fn visible(&self) -> impl Iterator<Item = &NamedRef> {
+        let lone = self
+            .refs
+            .iter()
+            .filter(|r| r.kind == RefKind::Branch)
+            .count()
+            == 1;
+        self.refs
+            .iter()
+            .filter(move |r| !(lone && r.kind == RefKind::Branch && r.is_default))
+    }
+
+    /// Whether expanding this repository would reveal anything at all.
+    fn has_visible(&self) -> bool {
+        self.visible().next().is_some()
+    }
+}
+
 /// A render-ready line, cached so filtering isn't redone every frame.
 pub struct ReposRow {
     pub label: String,
@@ -118,6 +152,9 @@ pub struct ReposRow {
     /// `Some` on ref rows, `None` on repository rows.
     pub reference: Option<String>,
     pub expanded: bool,
+    /// Whether expanding this row shows anything. Optimistic until the refs
+    /// land — a repository is assumed to have some to list.
+    pub expandable: bool,
     /// A repository row whose refs are still in flight.
     pub loading: bool,
 }
@@ -126,6 +163,9 @@ pub struct ReposRow {
 pub struct ReposView {
     pub repos: Vec<Repository>,
     pub refs: HashMap<String, RefsSlot>,
+    /// Whether each repository has refs worth listing, as answered by the
+    /// start-up probe. Only consulted until the full refs arrive.
+    pub probe: HashMap<String, bool>,
     pub expanded: HashSet<String>,
     pub rows: Vec<ReposRow>,
     pub state: ListState,
@@ -178,13 +218,19 @@ impl ReposView {
                 repo: repo.id.clone(),
                 reference: None,
                 expanded,
+                expandable: match slot {
+                    // The full ref list, once fetched, is the authority.
+                    Some(s) if matches!(s.load, Load::Ready) => s.has_visible(),
+                    // Otherwise the probe, and optimism until it answers.
+                    _ => self.probe.get(&repo.id).copied().unwrap_or(true),
+                },
                 loading: matches!(slot.map(|s| &s.load), Some(Load::Loading)),
             });
             if !expanded {
                 continue;
             }
             let Some(slot) = slot else { continue };
-            for r in &slot.refs {
+            for r in slot.visible() {
                 rows.push(ReposRow {
                     label: r.id.clone(),
                     meta: r.commit_id.chars().take(8).collect(),
@@ -196,6 +242,7 @@ impl ReposView {
                     repo: repo.id.clone(),
                     reference: Some(r.id.clone()),
                     expanded: false,
+                    expandable: false,
                     loading: false,
                 });
             }
@@ -596,6 +643,10 @@ pub struct App {
     crawl_token: Arc<AtomicU64>,
     /// A `--repo`/`--ref` jump waiting for the repository list to arrive.
     pending_jump: Option<(String, Option<String>)>,
+    /// Repository whose refs `→` is waiting on. If they turn out to hold
+    /// nothing worth listing, the move carries on into the tree instead of
+    /// leaving the keypress looking like it did nothing.
+    descend_after_refs: Option<String>,
     /// Directories a reload should re-open, applied as each level lands.
     pending_expand: Vec<String>,
     /// Set when the pane-one selection moved; the tree follows once it settles.
@@ -634,6 +685,7 @@ impl App {
             tick: 0,
             crawl_token: Arc::new(AtomicU64::new(0)),
             pending_jump: None,
+            descend_after_refs: None,
             pending_expand: Vec::new(),
             target_dirty: None,
             hits: Hits::default(),
@@ -672,28 +724,6 @@ impl App {
             .map(|(repo, reference)| (repo.as_str(), reference.as_str()))
     }
 
-    pub fn breadcrumb(&self) -> Vec<String> {
-        let mut parts = Vec::new();
-        let Some((repo, reference)) = &self.tree.key else {
-            return parts;
-        };
-        parts.push(repo.clone());
-        parts.push(reference.clone());
-        if self.focus == Focus::Tree
-            && let Some(node) = self.tree.selected()
-        {
-            parts.extend(
-                node.stat
-                    .path
-                    .trim_end_matches('/')
-                    .split('/')
-                    .filter(|s| !s.is_empty())
-                    .map(String::from),
-            );
-        }
-        parts
-    }
-
     /// The filter belonging to whichever pane has focus.
     pub fn filter(&self) -> &str {
         match self.focus {
@@ -712,6 +742,54 @@ impl App {
         tokio::spawn(async move {
             let res = client.repositories().await.map_err(fmt_err);
             let _ = tx.send(Msg::Repos(req, res));
+        });
+    }
+
+    /// Ask every repository whether it has refs worth listing, so the pane's
+    /// chevrons are right from the start rather than correcting themselves as
+    /// you open things. One or two capped listings per repository, eight at a
+    /// time; repositories whose refs are already in hand are skipped.
+    fn probe_refs(&mut self) {
+        let todo: Vec<(String, String)> = self
+            .repos
+            .repos
+            .iter()
+            .filter(|r| {
+                !self.repos.probe.contains_key(&r.id)
+                    && !matches!(
+                        self.repos.refs.get(&r.id).map(|s| &s.load),
+                        Some(Load::Ready) | Some(Load::Loading)
+                    )
+            })
+            .map(|r| (r.id.clone(), r.default_branch.clone()))
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+
+        let req = self.repos.req;
+        let include_tags = self.cfg.ui.show_tags;
+        self.inflight += todo.len();
+        let (tx, client) = (self.tx.clone(), self.client.clone());
+        tokio::spawn(async move {
+            futures::stream::iter(todo)
+                .for_each_concurrent(PROBE_CONCURRENCY, |(repo, default_branch)| {
+                    let (tx, client) = (tx.clone(), client.clone());
+                    async move {
+                        // A probe that fails leaves the repository looking
+                        // expandable; opening it will report the error itself.
+                        let listable = client
+                            .has_listable_refs(&repo, &default_branch, include_tags)
+                            .await
+                            .unwrap_or(true);
+                        let _ = tx.send(Msg::RefProbe {
+                            req,
+                            repo,
+                            listable,
+                        });
+                    }
+                })
+                .await;
         });
     }
 
@@ -819,6 +897,7 @@ impl App {
         match self.focus {
             Focus::Repos => {
                 self.repos.refs.clear();
+                self.repos.probe.clear();
                 self.load_repos();
                 self.set_status("reloading repositories…", false);
             }
@@ -1077,6 +1156,7 @@ impl App {
                         let live: HashSet<String> =
                             self.repos.repos.iter().map(|r| r.id.clone()).collect();
                         self.repos.expanded.retain(|id| live.contains(id));
+                        self.repos.probe.retain(|id, _| live.contains(id));
                         let stale: Vec<String> = self
                             .repos
                             .expanded
@@ -1089,6 +1169,9 @@ impl App {
                         }
                         self.repos.rebuild();
                         self.apply_jump();
+                        // After the jump, so a repository it already opened
+                        // isn't probed for what its refs will answer anyway.
+                        self.probe_refs();
                         self.sync_target();
                         self.mark_preview_dirty();
                     }
@@ -1105,13 +1188,38 @@ impl App {
                 if self.repos.refs.get(&repo).map(|s| s.req) != Some(req) {
                     return;
                 }
+                let descending = self.descend_after_refs.as_deref() == Some(repo.as_str());
+                if descending {
+                    self.descend_after_refs = None;
+                }
                 match res {
                     Ok(refs) => {
+                        let mut empty = false;
                         if let Some(slot) = self.repos.refs.get_mut(&repo) {
                             slot.refs = refs;
                             slot.load = Load::Ready;
+                            empty = !slot.has_visible();
+                        }
+                        // A repository whose only branch is its default has
+                        // nothing to list; don't leave it looking open with
+                        // nothing under it.
+                        if empty {
+                            self.repos.expanded.remove(&repo);
                         }
                         self.repos.rebuild();
+                        // `→` on such a repository means "descend", so finish
+                        // the move now that we know no ref list is in the way.
+                        if empty
+                            && descending
+                            && self.focus == Focus::Repos
+                            && self
+                                .repos
+                                .selected_row()
+                                .is_some_and(|r| r.repo == repo && r.reference.is_none())
+                        {
+                            self.focus = Focus::Tree;
+                            self.mark_preview_dirty();
+                        }
                         self.apply_jump_ref(&repo);
                     }
                     Err(e) => {
@@ -1123,6 +1231,19 @@ impl App {
                         self.set_status(e, true);
                     }
                 }
+            }
+
+            Msg::RefProbe {
+                req,
+                repo,
+                listable,
+            } => {
+                self.inflight = self.inflight.saturating_sub(1);
+                if self.repos.req != req {
+                    return;
+                }
+                self.repos.probe.insert(repo, listable);
+                self.repos.rebuild();
             }
 
             Msg::Children {
@@ -1277,17 +1398,26 @@ impl App {
             return;
         }
         self.pending_jump = None;
-        match self
+        if let Some(row) = self
             .repos
             .rows
             .iter()
             .position(|r| r.repo == repo && r.reference.as_deref() == Some(reference.as_str()))
         {
-            Some(row) => {
-                self.repos.state.select(Some(row));
-                self.sync_target();
-            }
-            None => self.set_status(format!("ref `{reference}` not found in `{repo}`"), true),
+            self.repos.state.select(Some(row));
+            self.sync_target();
+            return;
+        }
+        // A lone default branch has no row of its own — the repository row
+        // `apply_jump` already selected stands for it, and the tree is loading
+        // it. Only a ref that genuinely isn't there is worth reporting.
+        let exists = self
+            .repos
+            .refs
+            .get(repo)
+            .is_some_and(|slot| slot.refs.iter().any(|r| r.id == reference));
+        if !exists {
+            self.set_status(format!("ref `{reference}` not found in `{repo}`"), true);
         }
     }
 
@@ -1409,13 +1539,20 @@ impl App {
                 let Some(row) = self.repos.selected_row() else {
                     return;
                 };
-                let (repo, is_ref, expanded) =
-                    (row.repo.clone(), row.reference.is_some(), row.expanded);
-                if is_ref || expanded {
+                let (repo, is_ref, expanded, expandable) = (
+                    row.repo.clone(),
+                    row.reference.is_some(),
+                    row.expanded,
+                    row.expandable,
+                );
+                if is_ref || expanded || !expandable {
                     // Nothing further to open in pane one — step into the tree.
                     self.focus = Focus::Tree;
                     self.mark_preview_dirty();
                 } else {
+                    // Its refs may hold only the default branch, which is not
+                    // listed; the reply carries the descent on if so.
+                    self.descend_after_refs = Some(repo.clone());
                     self.expand_repo(&repo);
                 }
             }
@@ -1489,7 +1626,7 @@ impl App {
                     return;
                 };
                 let (repo, expanded) = (row.repo.clone(), row.expanded);
-                if row.reference.is_some() {
+                if row.reference.is_some() || !row.expandable {
                     return;
                 }
                 if expanded {
@@ -1677,7 +1814,7 @@ impl App {
                 Focus::Repos => self
                     .repos
                     .selected_row()
-                    .is_some_and(|r| r.reference.is_none()),
+                    .is_some_and(|r| r.reference.is_none() && r.expandable),
                 Focus::Tree => self.tree.selected().is_some_and(|n| n.is_dir()),
             };
             if expandable {
@@ -1761,6 +1898,7 @@ impl App {
                 self.repos = ReposView::default();
                 self.focus = Focus::Repos;
                 self.pending_jump = None;
+                self.descend_after_refs = None;
                 self.pending_expand.clear();
                 self.set_target(None);
                 self.load_repos();
@@ -1912,4 +2050,82 @@ fn hex_dump(bytes: &[u8]) -> Vec<String> {
             format!("{:08x}  {:<47}  {}", i * 16, hex.join(" "), ascii)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot(refs: Vec<NamedRef>) -> RefsSlot {
+        RefsSlot {
+            load: Load::Ready,
+            refs,
+            req: 0,
+        }
+    }
+
+    fn branch(id: &str, is_default: bool) -> NamedRef {
+        NamedRef {
+            id: id.into(),
+            commit_id: "c0ffee".into(),
+            kind: RefKind::Branch,
+            is_default,
+        }
+    }
+
+    fn tag(id: &str) -> NamedRef {
+        NamedRef {
+            id: id.into(),
+            commit_id: "c0ffee".into(),
+            kind: RefKind::Tag,
+            is_default: false,
+        }
+    }
+
+    fn ids(slot: &RefsSlot) -> Vec<&str> {
+        slot.visible().map(|r| r.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_lone_default_branch_is_not_listed() {
+        let slot = slot(vec![branch("main", true)]);
+        assert!(ids(&slot).is_empty());
+        // The repository row alone reaches it, so there is nothing to expand.
+        assert!(!slot.has_visible());
+    }
+
+    #[test]
+    fn several_branches_are_all_listed() {
+        let slot = slot(vec![branch("main", true), branch("dev", false)]);
+        assert_eq!(ids(&slot), vec!["main", "dev"]);
+        assert!(slot.has_visible());
+    }
+
+    #[test]
+    fn tags_keep_a_lone_branch_hidden_but_the_repo_expandable() {
+        let slot = slot(vec![branch("main", true), tag("v1.0")]);
+        assert_eq!(ids(&slot), vec!["v1.0"]);
+        assert!(slot.has_visible());
+    }
+
+    #[test]
+    fn a_lone_branch_that_is_not_the_default_stays() {
+        // `selected_target` falls back to the repository's default branch, so a
+        // branch it doesn't name would be unreachable if it were hidden.
+        let slot = slot(vec![branch("orphan", false)]);
+        assert_eq!(ids(&slot), vec!["orphan"]);
+    }
+
+    #[test]
+    fn refs_still_loading_leave_the_repo_expandable() {
+        // Optimistic until the listing lands: the chevron shows up front.
+        let row_expandable = |s: &RefsSlot| match s {
+            s if matches!(s.load, Load::Ready) => s.has_visible(),
+            _ => true,
+        };
+        let mut pending = slot(vec![]);
+        pending.load = Load::Loading;
+        assert!(row_expandable(&pending));
+        assert!(!row_expandable(&slot(vec![branch("main", true)])));
+    }
 }

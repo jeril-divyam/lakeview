@@ -218,6 +218,61 @@ impl Client {
         Ok(out)
     }
 
+    /// A single capped page, for probes that only need to know whether an entry
+    /// or two exist rather than the whole listing.
+    async fn first_page<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        amount: u32,
+        what: &str,
+    ) -> Result<Vec<T>> {
+        let resp = self
+            .get(path)
+            .query(&[("amount", amount.to_string())])
+            .send()
+            .await
+            .with_context(|| what.to_string())?;
+        let resp = Self::check(resp, what).await?;
+        let page: Page<T> = resp
+            .json()
+            .await
+            .with_context(|| format!("{what}: unexpected response body"))?;
+        Ok(page.results)
+    }
+
+    /// Whether expanding this repository would list any ref at all. Mirrors the
+    /// browser's rule — a lone default branch is not worth a row of its own —
+    /// but answers it with two capped listings instead of every ref, so the
+    /// whole repository pane can be probed on start-up.
+    pub async fn has_listable_refs(
+        &self,
+        repo: &str,
+        default_branch: &str,
+        include_tags: bool,
+    ) -> Result<bool> {
+        let branches: Vec<RefEntry> = self
+            .first_page(
+                &format!("/repositories/{}/branches", enc(repo)),
+                2,
+                "listing branches",
+            )
+            .await?;
+        if branches_are_listable(&branches, default_branch) {
+            return Ok(true);
+        }
+        if include_tags {
+            let tags: Vec<RefEntry> = self
+                .first_page(
+                    &format!("/repositories/{}/tags", enc(repo)),
+                    1,
+                    "listing tags",
+                )
+                .await?;
+            return Ok(!tags.is_empty());
+        }
+        Ok(false)
+    }
+
     pub async fn repositories(&self) -> Result<Vec<Repository>> {
         self.paged("/repositories", &[], "listing repositories", 10_000)
             .await
@@ -365,6 +420,15 @@ impl Client {
     }
 }
 
+/// Whether a repository's branches are worth listing under it, given no more
+/// than the first two. Must agree with the browser's own rule (`RefsSlot::
+/// visible`), which hides a lone default branch because the repository row
+/// already selects it — if the two drift, the pane's chevron stops matching
+/// what expanding it shows.
+fn branches_are_listable(branches: &[RefEntry], default_branch: &str) -> bool {
+    branches.len() > 1 || branches.iter().any(|b| b.id != default_branch)
+}
+
 /// Percent-encode a single path segment (repo ids and refs may contain `/`).
 fn enc(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
@@ -377,4 +441,39 @@ fn enc(segment: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str) -> RefEntry {
+        RefEntry {
+            id: id.into(),
+            commit_id: "c0ffee".into(),
+        }
+    }
+
+    /// Each case here has a twin in `app::tests`, over the same repository shape
+    /// but the full ref list. They must reach the same answer.
+    #[test]
+    fn a_lone_default_branch_is_not_listable() {
+        assert!(!branches_are_listable(&[entry("main")], "main"));
+    }
+
+    #[test]
+    fn a_second_branch_makes_them_listable() {
+        // The probe caps at two, which is all it takes to know.
+        assert!(branches_are_listable(&[entry("main"), entry("dev")], "main"));
+    }
+
+    #[test]
+    fn a_lone_branch_that_is_not_the_default_is_listable() {
+        assert!(branches_are_listable(&[entry("orphan")], "main"));
+    }
+
+    #[test]
+    fn no_branches_are_not_listable() {
+        assert!(!branches_are_listable(&[], "main"));
+    }
 }

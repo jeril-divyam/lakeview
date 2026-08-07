@@ -11,7 +11,9 @@ use crate::theme::Theme;
 
 pub fn profiles(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
     let names = app.profile_names();
-    let height = (names.len() as u16 + 4)
+    // Borders, the padded row under the title, and slack — so the padding
+    // doesn't cost the last profile its row.
+    let height = (names.len() as u16 + 5)
         .min(area.height.saturating_sub(2))
         .max(5);
     let width = 54.min(area.width.saturating_sub(4));
@@ -24,7 +26,7 @@ pub fn profiles(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Theme::border(true))
         .style(Theme::base())
-        .padding(Padding::horizontal(1))
+        .padding(Padding::new(1, 1, 1, 0))
         .title_top(Line::from(vec![
             Span::raw(" "),
             Span::styled("Switch profile", Theme::accent_bold()),

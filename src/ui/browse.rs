@@ -93,17 +93,30 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// A pane frame with a left title and a right-aligned annotation.
-fn pane_block<'a>(title: &str, right: Vec<Span<'a>>, focused: bool, width: u16) -> Block<'a> {
+/// A pane frame with a left title and a right-aligned annotation. Every pane
+/// keeps a row of breathing room under its title; panes that want side padding
+/// too restate the whole set, since `padding` replaces rather than merges.
+///
+/// The list panes pass a grey `title_style` whether or not they have focus — the
+/// border and the selection bar already say where you are, so a pane's name and
+/// the ref it is showing are context rather than the thing to look at.
+fn pane_block<'a>(
+    title: &str,
+    title_style: Style,
+    right: Vec<Span<'a>>,
+    focused: bool,
+    width: u16,
+) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Theme::border(focused))
+        .padding(Padding::top(1))
         .title_top(Line::from(vec![
             Span::raw(" "),
             Span::styled(
                 truncate(title, width.saturating_sub(8) as usize),
-                Theme::title(focused),
+                title_style,
             ),
             Span::raw(" "),
         ]))
@@ -124,10 +137,9 @@ fn annotation<'a>(filter: &str, count: usize, ready: bool) -> Vec<Span<'a>> {
     right
 }
 
+/// The pane's own top padding sets these off from the border already.
 fn centered_note(text: &str, style: Style) -> Paragraph<'static> {
-    Paragraph::new(Line::styled(text.to_string(), style))
-        .centered()
-        .block(Block::default().padding(Padding::top(1)))
+    Paragraph::new(Line::styled(text.to_string(), style)).centered()
 }
 
 fn spinner(tick: usize) -> &'static str {
@@ -144,7 +156,13 @@ fn draw_repos(
     tick: usize,
 ) -> Rect {
     let right = annotation(&repos.filter, repos.rows.len(), true);
-    let block = pane_block("Repositories", right, focused, area.width);
+    let block = pane_block(
+        "Repositories",
+        Theme::title(false),
+        right,
+        focused,
+        area.width,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -188,10 +206,13 @@ fn render_repo_row(row: &ReposRow, width: usize, tick: usize) -> Line<'static> {
         RowKind::Tag => Style::new().fg(Theme::PURPLE),
     };
 
-    // A repository's chevron doubles as its icon; refs indent beneath it.
+    // A repository's chevron doubles as its icon; refs indent beneath it. One
+    // with nothing to list takes the same `●` its lone default branch would have
+    // worn a row below — the row stands for that branch, so it wears its mark.
     let prefix = match row.reference {
         None if row.loading => format!("{} ", spinner(tick)),
         None if row.expanded => "▾ ".into(),
+        None if !row.expandable => "● ".into(),
         None => "▸ ".into(),
         Some(_) => {
             let icon = match row.kind {
@@ -234,7 +255,7 @@ fn draw_tree(
     if tree.capped {
         right.insert(0, Span::styled(" capped ", Theme::error()));
     }
-    let block = pane_block(&title, right, focused, area.width);
+    let block = pane_block(&title, Theme::title(false), right, focused, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -351,8 +372,8 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, zoomed: bool) -> Rect {
         right.push(Span::styled(" zoom ", Theme::chip()));
         right.push(Span::raw(" "));
     }
-    let block = pane_block(&heading, right, zoomed, area.width)
-        .padding(Padding::horizontal(1));
+    let block = pane_block(&heading, Theme::title(zoomed), right, zoomed, area.width)
+        .padding(Padding::new(1, 1, 1, 0));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);

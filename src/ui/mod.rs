@@ -1,5 +1,6 @@
-//! Rendering. The frame is header / breadcrumb / body / footer, where the
-//! body is tab-dependent.
+//! Rendering. The frame is header / body / footer, where the body is
+//! tab-dependent. The header carries the tabs on the left and the profile on the
+//! right, with the filter you are typing in the gap between them.
 
 mod browse;
 mod commits;
@@ -10,7 +11,6 @@ use chrono::{Local, TimeZone};
 use humansize::{DECIMAL, format_size};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
@@ -25,16 +25,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Paint the whole canvas so the theme background wins over the terminal's.
     frame.render_widget(Block::new().style(Theme::base()), area);
 
-    let [header, crumbs, body, footer] = Layout::vertical([
+    let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
     .areas(area);
 
     draw_header(frame, app, header);
-    draw_breadcrumb(frame, app, crumbs);
 
     match app.tab {
         Tab::Browse => browse::draw(frame, app, body),
@@ -104,43 +102,66 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
         right.clear();
     }
 
+    let mut right_width = 0;
     if !right.is_empty() {
         right.push(Span::raw(" "));
+        right_width = right.iter().map(|s| s.content.width()).sum();
         frame.render_widget(
             Paragraph::new(Line::from(right)).alignment(Alignment::Right),
             inner,
         );
     }
+
+    if app.mode == Mode::Filter {
+        draw_filter(frame, app.filter(), inner, tabs_width, right_width);
+    }
 }
 
-fn draw_breadcrumb(frame: &mut Frame, app: &App, area: Rect) {
-    let parts = app.breadcrumb();
-    let mut spans = vec![Span::styled(" lakefs://", Theme::faint())];
-    if parts.is_empty() {
-        spans.push(Span::styled("(all repositories)", Theme::faint()));
-    }
-    for (i, part) in parts.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("/", Theme::faint()));
-        }
-        let style = match i {
-            0 => Theme::accent(),
-            1 => Style::new().fg(Theme::GREEN),
-            _ => Style::new().fg(Theme::FG),
-        };
-        spans.push(Span::styled(part.clone(), style));
+/// The filter being typed, in the gap between the tabs and the profile. The
+/// panes annotate their own titles with the needle once it is applied; this is
+/// the live one, with a cursor, and it only shows while you are typing.
+fn draw_filter(
+    frame: &mut Frame,
+    filter: &str,
+    inner: Rect,
+    tabs_width: usize,
+    right_width: usize,
+) {
+    let total = inner.width as usize;
+    let room = total.saturating_sub(tabs_width + right_width + 4);
+    // "filter: " and the cursor leave nothing worth showing below this.
+    if room < 12 {
+        return;
     }
 
-    // Filter indicator for the focused pane.
-    let filter = app.filter();
-    if !filter.is_empty() || app.mode == Mode::Filter {
-        spans.push(Span::styled("   filter: ", Theme::faint()));
-        spans.push(Span::styled(filter.to_string(), Theme::accent()));
-        if app.mode == Mode::Filter {
-            spans.push(Span::styled("█", Theme::accent()));
-        }
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let line = filter_line(&truncate(filter, room - 9));
+    let width = line_width(&line);
+    // Centred where the width allows, nudged aside where it doesn't — a centred
+    // line long enough to reach the tabs would be drawn straight over them.
+    let centred = total.saturating_sub(width) / 2;
+    let leftmost = tabs_width + 2;
+    let rightmost = total.saturating_sub(right_width + 2 + width);
+    let x = centred.clamp(leftmost, rightmost.max(leftmost));
+
+    let slot = Rect {
+        x: inner.x + x as u16,
+        y: inner.y,
+        width: width.min(total.saturating_sub(x)) as u16,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(line), slot);
+}
+
+fn filter_line(filter: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("filter: ", Theme::faint()),
+        Span::styled(filter.to_string(), Theme::accent()),
+        Span::styled("█", Theme::accent()),
+    ])
+}
+
+fn line_width(line: &Line) -> usize {
+    line.spans.iter().map(|s| s.content.width()).sum()
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
