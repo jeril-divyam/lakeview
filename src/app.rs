@@ -640,6 +640,9 @@ impl App {
             last_click: None,
         };
         app.load_repos();
+        if let Some(warning) = app.cfg.warnings.first().cloned() {
+            app.set_status(warning, true);
+        }
         app
     }
 

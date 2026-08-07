@@ -13,8 +13,11 @@ use super::{format_ts, human_size, justify, truncate};
 use crate::app::{App, Focus, Load, Mode, PreviewBody, ReposRow, ReposView, RowKind, TreeView};
 use crate::theme::Theme;
 
-/// The tree pane never shrinks below this; the preview goes first instead.
+/// Floors the configured widths are held to, so no ratio can squeeze a pane
+/// down to nothing. The preview drops out before the tree reaches its floor.
+const MIN_REPOS: u16 = 12;
 const MIN_TREE: u16 = 24;
+const MIN_PREVIEW: u16 = 20;
 /// Room a tree row keeps for its name however deep it sits.
 const MIN_NAME: usize = 10;
 
@@ -29,23 +32,35 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // The repository pane takes its fixed width; the tree and the preview
-    // split what is left evenly. On a narrow terminal panes drop out rather
-    // than being crushed — the preview goes first, then the repository list,
-    // leaving the focused pane the whole width.
-    let repos_w = app.cfg.ui.repos_width.clamp(14, 40);
-    let show_repos = area.width >= repos_w + MIN_TREE;
+    // The repositories pane takes its configured columns; the tree and the
+    // preview divide what is left by their ratios. On a narrow terminal panes
+    // drop out rather than being crushed — the preview goes first, then the
+    // repository list, leaving the focused pane the whole width.
+    let ui = &app.cfg.ui;
+    let show_repos = area.width >= MIN_REPOS + MIN_TREE;
+    let repos_w = ui
+        .repos_width
+        .max(MIN_REPOS)
+        .min(area.width.saturating_sub(MIN_TREE));
     let remainder = area.width.saturating_sub(if show_repos { repos_w } else { 0 });
-    let show_preview = app.cfg.ui.preview_percent > 0 && remainder >= 2 * MIN_TREE;
+
+    let tree_ratio = ui.tree_ratio.max(1) as u32;
+    let preview_ratio = ui.preview_ratio as u32;
+    let show_preview = preview_ratio > 0 && remainder >= MIN_TREE + MIN_PREVIEW;
 
     let mut constraints = Vec::with_capacity(3);
     if show_repos {
         constraints.push(Constraint::Length(repos_w));
     }
-    constraints.push(Constraint::Fill(1));
     if show_preview {
-        constraints.push(Constraint::Fill(1));
+        // Honour the ratio, but never past either pane's floor. The preview
+        // takes the remaining columns, so rounding can't leave a gap.
+        let tree_w = (remainder as u32 * tree_ratio / (tree_ratio + preview_ratio)) as u16;
+        constraints.push(Constraint::Length(
+            tree_w.clamp(MIN_TREE, remainder - MIN_PREVIEW),
+        ));
     }
+    constraints.push(Constraint::Fill(1));
     let chunks = Layout::horizontal(constraints).split(area);
 
     let mut next = 0;

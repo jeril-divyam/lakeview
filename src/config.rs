@@ -21,6 +21,11 @@ pub struct Config {
 
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+
+    /// Notes about the file itself — keys that no longer do anything, say.
+    /// Shown once on start-up so a stale setting isn't ignored in silence.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -50,15 +55,17 @@ pub struct Profile {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UiConfig {
-    /// Width of the repositories pane. `column_width` is accepted as an alias
-    /// so configs written for the old Miller-column layout still load.
+    /// Width of the repositories pane, in columns. `column_width` is accepted
+    /// as an alias so configs written for the old Miller-column layout load.
     #[serde(default = "default_repos_width", alias = "column_width")]
     pub repos_width: u16,
-    /// Whether the preview pane is shown; `0` hides it. The tree and the
-    /// preview always split the width left over by the repository pane
-    /// evenly, so this no longer sets a width.
-    #[serde(default = "default_preview_pct")]
-    pub preview_percent: u16,
+    /// The tree's share of the width the repositories pane leaves over,
+    /// weighed against `preview_ratio`.
+    #[serde(default = "default_ratio")]
+    pub tree_ratio: u16,
+    /// The preview's share of that same width; `0` hides the pane entirely.
+    #[serde(default = "default_ratio")]
+    pub preview_ratio: u16,
     /// Maximum number of bytes fetched when previewing an object.
     #[serde(default = "default_preview_bytes")]
     pub preview_bytes: u64,
@@ -87,8 +94,8 @@ fn default_timeout() -> u64 {
 fn default_repos_width() -> u16 {
     28
 }
-fn default_preview_pct() -> u16 {
-    38
+fn default_ratio() -> u16 {
+    1
 }
 fn default_preview_bytes() -> u64 {
     64 * 1024
@@ -104,7 +111,8 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             repos_width: default_repos_width(),
-            preview_percent: default_preview_pct(),
+            tree_ratio: default_ratio(),
+            preview_ratio: default_ratio(),
             preview_bytes: default_preview_bytes(),
             page_size: default_page_size(),
             search_max_requests: default_search_budget(),
@@ -127,6 +135,20 @@ impl Config {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut cfg: Self =
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+
+        // Unknown keys parse fine and are dropped, so a setting that has been
+        // replaced would otherwise just stop working with no explanation.
+        let table: toml::Value =
+            toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        if table
+            .get("ui")
+            .and_then(|ui| ui.get("preview_percent"))
+            .is_some()
+        {
+            cfg.warnings.push(
+                "ui.preview_percent is gone — use preview_ratio (0 hides the pane)".into(),
+            );
+        }
 
         // Resolve ${ENV_VAR} references in credentials.
         for (name, profile) in cfg.profiles.iter_mut() {
@@ -200,8 +222,9 @@ pub const TEMPLATE: &str = r#"# lakeview configuration — https://docs.lakefs.i
 default_profile = "local"
 
 [ui]
-repos_width = 28        # width of the repositories pane
-preview_percent = 38    # set to 0 to hide the preview pane
+repos_width = 28        # columns given to the repositories pane
+tree_ratio = 1          # the tree and the preview divide the rest by these
+preview_ratio = 1       # two ratios; set preview_ratio = 0 to hide the pane
 preview_bytes = 65536   # max bytes fetched when previewing a file
 page_size = 500         # entries fetched per API request
 search_max_requests = 300  # listings a recursive `/` search may spend
