@@ -1805,6 +1805,30 @@ impl App {
         }
     }
 
+    /// `a` — unfold the whole zoomed document: all of it when the cursor is on
+    /// something folded, else to the level the cursor is reading at.
+    ///
+    /// A level is otherwise invisible — a row folded at level 2 looks like one
+    /// folded at level 5 — so it is worth saying which one you got.
+    pub fn expand_all(&mut self) {
+        let Some(doc) = self.zoom_doc_mut() else {
+            return;
+        };
+        match doc.expand_all() {
+            Some(depth) => self.set_status(format!("unfolded everything to level {depth}"), false),
+            None => self.set_status("unfolded everything", false),
+        }
+    }
+
+    /// `c` — fold the whole zoomed document back up.
+    pub fn collapse_all(&mut self) {
+        let Some(doc) = self.zoom_doc_mut() else {
+            return;
+        };
+        doc.collapse_all();
+        self.set_status("folded everything", false);
+    }
+
     /// `d` — download the selected object into the working directory.
     ///
     /// The whole object, not the `preview_bytes` the preview settles for, and

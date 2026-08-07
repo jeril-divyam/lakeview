@@ -1346,6 +1346,56 @@ mod tests {
         assert!(app.hits.preview_rows.iter().all(|r| *r < 6));
     }
 
+    // ── all at once ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_and_c_level_the_whole_zoomed_document() {
+        let mut app = test_app();
+        app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(
+            "{\"a\":1,\"m\":{\"p\":2}}\n{\"a\":3,\"m\":{\"p\":4}}\n",
+            false,
+        )));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+
+        // The cursor starts on a folded record, so `a` opens all of it.
+        app.expand_all();
+        let all = screen(&framed(&mut app, 60, 24));
+        assert_eq!(all.matches(r#"▾ "m": {"#).count(), 2, "{all}");
+        assert!(all.contains("· unfolded everything"), "{all}");
+        assert!(!all.contains("level"), "no level was copied: {all}");
+
+        app.collapse_all();
+        let all = screen(&framed(&mut app, 60, 24));
+        assert_eq!(all.matches("▸ {").count(), 2, "both records folded: {all}");
+        assert!(all.contains("folded everything"), "{all}");
+
+        // Open one record to its top level and stand on it: now `a` has a level
+        // to copy, and every record is brought to it rather than opened whole.
+        app.open();
+        app.expand_all();
+        let all = screen(&framed(&mut app, 60, 24));
+        assert_eq!(all.matches(r#"▸ "m": {"p":"#).count(), 2, "{all}");
+        assert!(all.contains("to level 1"), "{all}");
+    }
+
+    /// Nothing outside a foldable zoom has levels, so the keys are quiet there
+    /// rather than reporting something that didn't happen.
+    #[tokio::test]
+    async fn a_and_c_do_nothing_outside_a_foldable_zoom() {
+        let mut app = test_app();
+        app.status = None;
+        app.expand_all();
+        app.collapse_all();
+        assert!(app.status.is_none());
+
+        // Zoomed, but on a flat body: the same keys have nothing to fold.
+        app.preview.body = Some(PreviewBody::Text(vec!["plain".into()]));
+        app.mode = Mode::Zoom;
+        app.expand_all();
+        assert!(app.status.is_none());
+    }
+
     // ── the key-filter menu ──────────────────────────────────────────────
 
     /// The whole frame: the menu is drawn over the body by `ui::draw`, so the

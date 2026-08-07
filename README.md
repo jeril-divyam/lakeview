@@ -109,6 +109,7 @@ secrets need not be stored on disk. `lakeview init` writes the file with mode
 | `g` / `G` | first / last entry |
 | `Ctrl-d` / `Ctrl-u` | half-page down / up |
 | `/` | search the focused pane (`Esc` clears) |
+| `a` / `c` | in a zoom, unfold it all — or to the level you are reading at / fold it all back up |
 | `F` | in a zoomed `.jsonl`, filter which keys the records show |
 | `d` | download the selected file into the working directory |
 | `r` | reload the focused pane |
@@ -213,6 +214,41 @@ either way, and what was open inside it is remembered.
 `←` winds back out the way it does in the tree: it folds what is open, steps out
 to the enclosing block when there is nothing there to fold, and only once the
 whole record is folded again does it leave the zoom. `Esc` leaves at once.
+
+### All at once
+
+`a` reads what the cursor is on. On something **folded** there is no level to
+copy, so it opens **all of it** — every record, all the way down. On something
+**open** it means "the rest like this one", and brings every record to the level
+the one you are on is open to: having unfolded one record's `meta`, `a` gives you
+the whole file that way.
+
+Levelling off folds as well as unfolds — a record somebody had opened deeper than
+the level goes back to it, so "every record at level 2" is what you get rather
+than "at least level 2". The footer names the level it settled on, since a row
+folded at level 2 looks no different from one folded at level 5.
+
+`c` folds everything back up, however deep any of it was open, and forgets what
+was open inside — unlike `←` and `space`, which remember. It is the state the file
+was zoomed in at.
+
+In a zoomed `.json` the two are simpler: the file is one value rather than a shape
+repeated, so there is nothing to level it against. `a` opens the whole of it
+wherever the cursor sits, and `c` shuts it back to level 1 — the root's own
+members, since the root brackets don't fold.
+
+A folded row is truncated rather than wrapped — unfolding it is how you see the
+rest, and re-flowing one record over ten lines would bury the records under it.
+Everything else wraps, so the long values an unfolded record exposes are
+readable at full width.
+
+The side pane doesn't fold — at that width there is no room to usefully — but it
+gives each record a line, syntax-coloured like the JSON preview beside it. The
+records are re-spaced to be coloured at all, so what it shows is the JSON each
+line holds rather than its exact bytes; the zoom is the same. A record that isn't
+valid JSON keeps its raw text, in red with the parse error beside it, and unfolds
+to show the message and the text. Records lost to the `preview_bytes` cap are
+marked `truncated` in the pane's title rather than shown half-read.
 
 ### Filtering keys
 

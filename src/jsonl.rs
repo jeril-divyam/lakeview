@@ -57,6 +57,59 @@ impl Open {
         let target = node.children.entry(last.clone()).or_default();
         target.open = !target.open;
     }
+
+    /// Levels unfolded below this node: `0` when nothing under it is open. A
+    /// child that is folded stops the count, since nothing under it is on show
+    /// however much of it was open before.
+    fn depth(&self) -> usize {
+        self.children
+            .values()
+            .filter(|c| c.open)
+            .map(|c| 1 + c.depth())
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// An `Open` tree unfolding every container inside `value` down to `depth`
+/// levels, and nothing deeper.
+///
+/// Level 1 is the value's own members, which are always on show, so nothing
+/// opens until level 2. Built from the value rather than edited into the old
+/// tree, so what the levels say is what the document shows — a branch somebody
+/// had opened deeper folds back to the level like any other.
+fn opened_to(value: &Value, depth: usize) -> Open {
+    let mut open = Open::default();
+    fill(&mut open, value, depth.saturating_sub(1));
+    open
+}
+
+/// Open every container in `value`, recursing while `levels` remain.
+fn fill(open: &mut Open, value: &Value, levels: usize) {
+    if levels == 0 {
+        return;
+    }
+    // Only what folds gets a node; a scalar is never asked about.
+    let mut descend = |seg: Seg, val: &Value| {
+        if brackets(val).is_some() {
+            let child = open.children.entry(seg).or_default();
+            child.open = true;
+            fill(child, val, levels - 1);
+        }
+    };
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map {
+                descend(Seg::Key(key.clone()), val);
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                descend(Seg::Index(i), item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The child at `seg` if it is unfolded, `None` if it is folded or untouched.
@@ -381,6 +434,29 @@ pub trait Folding {
     /// close, which is the caller's cue to leave the zoom.
     fn back(&mut self) -> bool;
 
+    /// Unfold everything to `depth` levels and fold whatever is deeper, so the
+    /// whole document reads at one level however it was folded before. `0` folds
+    /// it up altogether; a document whose own brackets don't fold treats that
+    /// as `1`, its shallowest.
+    fn expand_to(&mut self, depth: usize);
+
+    /// What `a` should unfold to: `Some(level)` to bring the whole document up to
+    /// the level the cursor is reading at, `None` for all of it, however deep.
+    fn expand_target(&self) -> Option<usize>;
+
+    /// `a` — unfold, either as far as it goes or to the level the cursor names.
+    /// Returns the level everything now reads at, or `None` for all of it.
+    fn expand_all(&mut self) -> Option<usize> {
+        let target = self.expand_target();
+        self.expand_to(target.unwrap_or(usize::MAX));
+        target
+    }
+
+    /// `c` — fold everything back up, however deep any of it was open.
+    fn collapse_all(&mut self) {
+        self.expand_to(0);
+    }
+
     fn move_cursor(&mut self, delta: isize) {
         let last = self.rows_len().saturating_sub(1) as isize;
         let next = (self.cursor() as isize + delta).clamp(0, last) as usize;
@@ -464,6 +540,19 @@ impl Folding for JsonDoc {
         }
         self.open.toggle(&path);
         self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
+    }
+
+    /// The root brackets don't fold, so the file's shallowest level is 1 and a
+    /// `depth` of 0 means the same thing.
+    fn expand_to(&mut self, depth: usize) {
+        self.open = opened_to(&self.value, depth);
+        self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
+    }
+
+    /// A file is one value, not a shape repeated, so there is nothing to level
+    /// it against: `a` opens the whole of it and `c` shuts it back to level 1.
+    fn expand_target(&self) -> Option<usize> {
+        None
     }
 
     fn back(&mut self) -> bool {
@@ -689,6 +778,32 @@ impl Doc {
         self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
     }
 
+    /// How deep record `entry` is unfolded: `0` when it is folded onto its own
+    /// row, `1` when it is open with everything inside it folded, and so on.
+    fn record_depth(&self, entry: usize) -> usize {
+        let entry = &self.entries[entry];
+        if entry.expanded {
+            1 + entry.open.depth()
+        } else {
+            0
+        }
+    }
+
+    /// Put the cursor back on `entry`'s own row after something has changed the
+    /// shape of the whole document under it. Expanding or folding every record
+    /// at once moves every row, and the record you were reading is the one thing
+    /// worth holding on to.
+    fn land_on(&mut self, entry: Option<usize>) {
+        let row = entry.and_then(|entry| {
+            self.rows()
+                .iter()
+                .position(|r| r.entry == entry && r.sub == 0)
+        });
+        self.cursor = row
+            .unwrap_or(self.cursor)
+            .min(self.rows_len().saturating_sub(1));
+    }
+
     /// Unfold or fold a key in the menu, reporting whether anything moved. Kept
     /// apart from `edit_keys` because the menu's own shape changes nothing about
     /// what the records show, and re-pruning the file to fold a row would be
@@ -735,6 +850,37 @@ impl Folding for Doc {
             self.entries[entry].open.toggle(&path);
         }
         self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
+    }
+
+    /// Every record to the same level: `depth` of 0 folds them all onto their
+    /// own rows, 1 opens each to its top level with everything inside folded,
+    /// and so on down.
+    ///
+    /// A record that doesn't parse has no levels — it expands to its error and
+    /// its raw text, or folds back onto its row, and nothing in between.
+    fn expand_to(&mut self, depth: usize) {
+        let anchor = self.rows().get(self.cursor).map(|r| r.entry);
+        for entry in &mut self.entries {
+            entry.expanded = depth > 0;
+            entry.open = match &entry.value {
+                Some(value) => opened_to(value, depth),
+                None => Open::default(),
+            };
+        }
+        self.land_on(anchor);
+    }
+
+    /// Sitting on something folded, `a` means "open all of this" — there is no
+    /// level to copy, and the file is a shape repeated, so all of it means all of
+    /// every record. Sitting on something open, it means "the rest like this
+    /// one", and the level to copy is the one the cursor's record reads at.
+    fn expand_target(&self) -> Option<usize> {
+        let rows = self.rows();
+        let row = rows.get(self.cursor)?;
+        if row.folded {
+            return None;
+        }
+        Some(self.record_depth(row.entry))
     }
 
     /// Ascends the way it does in the tree, and gives way only once the record
@@ -1220,6 +1366,195 @@ mod tests {
         assert_eq!(doc.cursor, 1);
         doc.select_edge(true);
         assert_eq!(doc.cursor, 0);
+    }
+
+    // ── all at once ──────────────────────────────────────────────────────
+
+    /// Two records of the same shape, nested three levels deep.
+    fn nested() -> Doc {
+        doc(&[
+            r#"{"a":1,"m":{"p":2,"q":{"r":3}}}"#,
+            r#"{"a":4,"m":{"p":5,"q":{"r":6}}}"#,
+        ])
+    }
+
+    /// How deep a whole JSON file is unfolded, its own members counting as 1.
+    fn json_depth(doc: &JsonDoc) -> usize {
+        1 + doc.open.depth()
+    }
+
+    /// The cursor starts on a folded record, so there is no level to copy and
+    /// `a` means all of it.
+    #[test]
+    fn expand_all_on_something_folded_opens_all_of_it() {
+        let mut doc = nested();
+        assert_eq!(doc.expand_all(), None);
+        assert_eq!(
+            rendered(&doc),
+            [
+                "▾ {2}",
+                "{",
+                r#"  "a": 1,"#,
+                r#"▾ "m": {"#,
+                r#"    "p": 2,"#,
+                r#"  ▾ "q": {"#,
+                r#"      "r": 3"#,
+                "    }",
+                "  }",
+                "}",
+                "▾ {2}",
+                "{",
+                r#"  "a": 4,"#,
+                r#"▾ "m": {"#,
+                r#"    "p": 5,"#,
+                r#"  ▾ "q": {"#,
+                r#"      "r": 6"#,
+                "    }",
+                "  }",
+                "}",
+            ]
+        );
+    }
+
+    /// A folded row inside an open record says the same thing: nothing is open
+    /// here, so open everything.
+    #[test]
+    fn expand_all_on_a_folded_row_inside_a_record_opens_all_of_it_too() {
+        let mut doc = nested();
+        doc.toggle_row(0); // open the first record; row 3 is its folded "m"
+        assert!(doc.rows()[3].folded);
+        doc.set_cursor(3);
+        assert_eq!(doc.expand_all(), None);
+        assert_eq!(
+            rendered(&doc)
+                .iter()
+                .filter(|r| r.contains("▾ \"q\""))
+                .count(),
+            2
+        );
+    }
+
+    /// Standing on something open, `a` means "the rest like this one".
+    #[test]
+    fn expand_all_levels_the_document_at_the_cursor() {
+        let mut doc = nested();
+        // Open the first record two levels: itself, then "m".
+        doc.toggle_row(0);
+        doc.toggle_row(3);
+        assert_eq!(doc.record_depth(0), 2);
+
+        assert_eq!(doc.expand_all(), Some(2));
+        let rows = rendered(&doc);
+        // Both records now show "m" open with "q" folded inside it.
+        assert_eq!(rows.iter().filter(|r| r.contains("▾ \"m\": {")).count(), 2);
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("▸ \"q\": {")).count(),
+            2,
+            "{rows:?}"
+        );
+    }
+
+    /// Levelling off is not only opening: a record somebody had opened deeper
+    /// than the cursor folds back, or "every record at level 1" would be a lie.
+    #[test]
+    fn expand_all_folds_what_is_deeper_than_the_level() {
+        let mut doc = nested();
+        doc.expand_to(1);
+        doc.toggle_row(3); // open the first record's "m", a level past the rest
+
+        // Stand on the second record's own row, open at level 1, and level off.
+        let header = doc.rows().iter().position(|r| r.entry == 1).unwrap();
+        doc.set_cursor(header);
+        assert_eq!(doc.expand_all(), Some(1));
+        let rows = rendered(&doc);
+        assert!(
+            rows.iter().all(|r| !r.contains("▾ \"m\"")),
+            "nothing is left open past level 1: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn collapse_all_folds_every_record_however_deep_it_was() {
+        let mut doc = nested();
+        doc.expand_to(3);
+        assert!(doc.rows_len() > 2);
+
+        doc.collapse_all();
+        assert_eq!(
+            rendered(&doc),
+            [
+                r#"▸ {"a": 1, "m": {"p": 2, "q": {"r": 3}}}"#,
+                r#"▸ {"a": 4, "m": {"p": 5, "q": {"r": 6}}}"#,
+            ]
+        );
+        // And it is a reset, not a fold: unfolding a record again starts at its
+        // top level rather than reopening what used to be there.
+        doc.toggle_row(0);
+        assert_eq!(doc.record_depth(0), 1);
+    }
+
+    /// Both of these move every row in the document. The record you were reading
+    /// is what the cursor holds on to.
+    #[test]
+    fn all_at_once_keeps_the_cursor_on_its_record() {
+        let mut doc = nested();
+        doc.expand_to(1);
+        doc.set_cursor(7); // a body row of the second record
+        assert_eq!(doc.rows()[doc.cursor()].entry, 1);
+
+        doc.expand_all();
+        assert_eq!(doc.rows()[doc.cursor()].entry, 1);
+        assert_eq!(doc.rows()[doc.cursor()].sub, 0, "on the record's own row");
+
+        doc.collapse_all();
+        assert_eq!(doc.cursor(), 1);
+        assert!(doc.cursor() < doc.rows_len());
+    }
+
+    #[test]
+    fn a_record_that_does_not_parse_has_no_levels_to_speak_of() {
+        let mut doc = doc(&[r#"{"a":{"b":1}}"#, "oops"]);
+        doc.expand_to(3);
+        let rows = rendered(&doc);
+        assert!(rows.iter().any(|r| r.contains("invalid JSON")), "{rows:?}");
+        doc.collapse_all();
+        assert_eq!(doc.rows_len(), 2);
+    }
+
+    // ── all at once, over a whole JSON file ──────────────────────────────
+
+    /// A file is one value, so there is nothing to level it against: `a` opens
+    /// all of it wherever the cursor happens to be.
+    #[test]
+    fn a_json_file_opens_all_of_itself() {
+        let mut doc = json(r#"{"a":{"b":{"c":1}},"d":{"e":2}}"#);
+        assert_eq!(json_depth(&doc), 1, "it opens one level down");
+
+        assert_eq!(doc.expand_all(), None);
+        assert_eq!(
+            json_rendered(&doc),
+            [
+                "{",
+                r#"▾ "a": {"#,
+                r#"  ▾ "b": {"#,
+                r#"      "c": 1"#,
+                "    }",
+                "  },",
+                r#"▾ "d": {"#,
+                r#"    "e": 2"#,
+                "  }",
+                "}",
+            ]
+        );
+
+        // And `c` shuts it back to level 1 — the root brackets don't fold, so
+        // that is as far as folding goes.
+        doc.collapse_all();
+        assert_eq!(
+            json_rendered(&doc),
+            ["{", r#"▸ "a": {"b": {"c": 1}},"#, r#"▸ "d": {"e": 2}"#, "}"]
+        );
+        assert_eq!(json_depth(&doc), 1);
     }
 
     // ── the key filter ───────────────────────────────────────────────────

@@ -350,6 +350,10 @@ fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
                 app.download_selected();
             }
         }
+        // Zoom-only, and quiet elsewhere: nothing outside a foldable document
+        // has levels to level off.
+        KeyCode::Char('a') => app.expand_all(),
+        KeyCode::Char('c') => app.collapse_all(),
         // Only a zoomed `.jsonl` has keys to filter; `open_keys` says so when
         // that is not what is on screen.
         KeyCode::Char('F') => {

@@ -21,6 +21,7 @@ const NAVIGATION: &[(&str, &str)] = &[
 const ACTIONS: &[(&str, &str)] = &[
     ("/", "search the focused pane"),
     ("Esc", "clear the search / leave zoom"),
+    ("a / c", "in a zoom, unfold / fold all"),
     ("F", "filter the keys a .jsonl shows"),
     ("d", "download the selected file"),
     ("r", "reload the focused pane"),
@@ -44,7 +45,10 @@ listing its records a row apiece. →, Enter or space unfolds the selected row a
 and folds it back up from its opening row or its closing bracket either way. ← winds back out, \
 folding what is open and stepping out of what is not, and leaves the zoom only once nothing is \
 left to close; Esc leaves at once. Folded rows are truncated — unfolding is how you see the rest \
-— and everything else wraps. F over a zoomed .jsonl opens a menu of the keys its records use, \
+— and everything else wraps. a on a folded row unfolds the whole document, all the way down; on \
+an open one it brings every record to the level that row is open to. c folds all of it back up. A \
+zoomed .json has nothing to level itself against, so a opens all of it and c shuts it to its own \
+members. F over a zoomed .jsonl opens a menu of the keys its records use, \
 each switchable: space switches one, ← → fold the tree, a/n switch all or none, Enter applies and \
 Esc puts the old filter back.";
 
