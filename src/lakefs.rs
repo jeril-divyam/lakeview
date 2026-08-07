@@ -4,7 +4,9 @@
 //! follows pagination until the server stops or `max_entries` is reached.
 
 use anyhow::{Context, Result, bail};
+use futures::StreamExt;
 use serde::Deserialize;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::config::Profile;
 
@@ -393,6 +395,42 @@ impl Client {
         Ok(bytes.to_vec())
     }
 
+    /// Stream a whole object into `sink`, returning the bytes written.
+    ///
+    /// No `Range` header, unlike `get_object_head`: a download is the whole
+    /// object, whatever `preview_bytes` caps the preview at. The body is written
+    /// through as it arrives rather than collected, so an object far larger than
+    /// memory still lands.
+    pub async fn download_object(
+        &self,
+        repo: &str,
+        reference: &str,
+        path: &str,
+        sink: &mut (impl AsyncWrite + Unpin),
+    ) -> Result<u64> {
+        let resp = self
+            .get(&format!(
+                "/repositories/{}/refs/{}/objects",
+                enc(repo),
+                enc(reference)
+            ))
+            .query(&[("path", path)])
+            .send()
+            .await
+            .context("downloading object")?;
+        let resp = Self::check(resp, "downloading object").await?;
+
+        let mut written = 0u64;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("reading object body")?;
+            sink.write_all(&chunk).await.context("writing to disk")?;
+            written += chunk.len() as u64;
+        }
+        sink.flush().await.context("writing to disk")?;
+        Ok(written)
+    }
+
     pub async fn commits(&self, repo: &str, reference: &str) -> Result<Vec<Commit>> {
         self.paged(
             &format!(
@@ -475,5 +513,108 @@ mod tests {
     #[test]
     fn no_branches_are_not_listable() {
         assert!(!branches_are_listable(&[], "main"));
+    }
+
+    fn profile(endpoint: String) -> Profile {
+        Profile {
+            endpoint,
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+            default_repo: None,
+            default_ref: None,
+            verify_tls: true,
+            timeout_secs: 5,
+            description: None,
+        }
+    }
+
+    /// Serves one canned 200 on a loopback port, handing back the request head
+    /// it was sent so the caller can check what was asked for.
+    async fn serve_once(body: String) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        (format!("http://{addr}"), rx)
+    }
+
+    /// The whole body reaches the sink, in however many chunks it arrives — and
+    /// no `Range` header goes out, which is what separates a download from the
+    /// capped fetch the preview makes.
+    #[tokio::test]
+    async fn a_download_streams_the_whole_body_and_asks_for_all_of_it() {
+        let body = "x".repeat(200_000);
+        let (endpoint, request) = serve_once(body.clone()).await;
+        let client = Client::new(&profile(endpoint), 500).unwrap();
+
+        let mut sink: Vec<u8> = Vec::new();
+        let written = client
+            .download_object("repo", "main", "data/big.bin", &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(written, body.len() as u64);
+        assert_eq!(sink, body.as_bytes());
+
+        let head = request.await.unwrap();
+        assert!(
+            !head.to_ascii_lowercase().contains("range:"),
+            "a download is the whole object: {head}"
+        );
+        assert!(head.contains("path=data%2Fbig.bin"), "{head}");
+        assert!(
+            head.contains("authorization:") || head.contains("Authorization:"),
+            "{head}"
+        );
+    }
+
+    /// A failed download reports the server's own message rather than writing a
+    /// file full of the error body.
+    #[tokio::test]
+    async fn a_download_that_fails_says_why() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"message":"path not found"}"#;
+            let head = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        let client = Client::new(&profile(format!("http://{addr}")), 500).unwrap();
+        let mut sink: Vec<u8> = Vec::new();
+        let err = client
+            .download_object("repo", "main", "nope", &mut sink)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("path not found"), "{err}");
+        assert!(sink.is_empty(), "nothing is written when the fetch fails");
     }
 }

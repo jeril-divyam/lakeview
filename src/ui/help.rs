@@ -21,7 +21,7 @@ const NAVIGATION: &[(&str, &str)] = &[
 const ACTIONS: &[(&str, &str)] = &[
     ("/", "search the focused pane"),
     ("Esc", "clear the search / leave zoom"),
-    ("y", "copy the lakefs:// URI"),
+    ("d", "download the selected file"),
     ("r", "reload the focused pane"),
     ("p", "switch profile"),
     ("1 / 2 / 3", "jump to a tab"),

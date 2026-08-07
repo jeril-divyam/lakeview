@@ -20,7 +20,7 @@ configurable ratio.
 │ ● analytics    main││ ▸ images/               ││  1 {                        │
 │                    ││   README.md       120 B ││  2   "clicks": 2,           │
 ╰────────────────────╯╰─────────────────────────╯╰─────────────────────────────╯
-      ↑↓/jk move  →/l open  ←/h back  space toggle  / search  y copy  q quit
+    ↑↓/jk move  →/l open  ←/h back  space toggle  / search  d download  q quit
 ```
 
 Selecting a repository opens its default branch straight away — the listing
@@ -109,7 +109,7 @@ secrets need not be stored on disk. `lakeview init` writes the file with mode
 | `g` / `G` | first / last entry |
 | `Ctrl-d` / `Ctrl-u` | half-page down / up |
 | `/` | search the focused pane (`Esc` clears) |
-| `y` | copy the selected `lakefs://` URI (OSC 52, works over SSH) |
+| `d` | download the selected file into the working directory |
 | `r` | reload the focused pane |
 | `p` | switch profile |
 | `1` `2` `3` / `Tab` | switch tab |
@@ -131,6 +131,21 @@ search never touches your own expand/collapse state.
 A search stops after `search_max_requests` directory listings and says so
 rather than quietly returning a partial result. Nothing is fetched twice, so
 extending the search term costs nothing.
+
+## Download
+
+`d` on a file in the tree downloads it into the directory you started `lakeview`
+in, under its own name. The whole object is fetched — `preview_bytes` caps what
+the preview reads, not this — and streamed to disk, so an object larger than
+memory still lands. The footer names the file and its size when it finishes.
+
+An existing file is never overwritten: `report.csv` arriving a second time is
+written as `report (1).csv`. The download runs in the background, so browsing
+carries on while it does, and it reports where it landed even if you have moved
+on to something else by then.
+
+`d` works on files, not prefixes — downloading a whole subtree is a different
+thing, so a directory says so rather than quietly doing nothing.
 
 ## JSONL
 
@@ -213,4 +228,5 @@ selection, set `mouse = false` under `[ui]` and everything stays keyboard-driven
 - JSON is re-indented and syntax-coloured, preserving the file's key order. A
   file too large to fetch whole won't parse, so it renders as plain text.
 - `.jsonl` and `.ndjson` files unfold record by record — see below.
-- Everything is read-only — lakeview never writes to your lakeFS server.
+- Everything is read-only — lakeview never writes to your lakeFS server. `d` is
+  the only thing it writes anywhere, and only to the working directory.

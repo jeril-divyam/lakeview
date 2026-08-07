@@ -183,14 +183,14 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let hints: &[(&str, &str)] = match (app.tab, &app.mode) {
         (_, Mode::Filter) => &[("type", "filter"), ("Enter", "apply"), ("Esc", "clear")],
         (_, Mode::Profiles(_)) => &[("↑↓/jk", "move"), ("Enter", "switch"), ("Esc", "cancel")],
-        (_, Mode::Zoom) => &[("↑↓/jk", "scroll"), ("Esc/h", "back"), ("y", "copy uri")],
+        (_, Mode::Zoom) => &[("↑↓/jk", "scroll"), ("Esc/h", "back"), ("d", "download")],
         (Tab::Browse, _) => &[
             ("↑↓/jk", "move"),
             ("→/l", "open"),
             ("←/h", "back"),
             ("space", "toggle"),
             ("/", "search"),
-            ("y", "copy"),
+            ("d", "download"),
             ("r", "reload"),
             ("q", "quit"),
         ],

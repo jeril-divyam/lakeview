@@ -7,12 +7,10 @@ mod lakefs;
 mod theme;
 mod ui;
 
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use ratatui::crossterm::event::{
@@ -302,7 +300,12 @@ fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
             Tab::Commits => app.load_commits(true),
             _ => app.reload_focused(),
         },
-        KeyCode::Char('y') => copy_selection(app),
+        // After the `Ctrl-d` arm above, which claims the modified key.
+        KeyCode::Char('d') => {
+            if app.tab == Tab::Browse {
+                app.download_selected();
+            }
+        }
         KeyCode::Char('p') => {
             let current = app
                 .profile_names()
@@ -333,20 +336,6 @@ fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
             app.select_tab(prev);
         }
         _ => {}
-    }
-}
-
-/// Copy via OSC 52 so it works over SSH without a clipboard daemon.
-fn copy_selection(app: &mut App) {
-    let Some(uri) = app.selection_uri() else {
-        return;
-    };
-    let encoded = base64::engine::general_purpose::STANDARD.encode(uri.as_bytes());
-    let mut stdout = std::io::stdout();
-    let ok = write!(stdout, "\x1b]52;c;{encoded}\x07").and_then(|_| stdout.flush());
-    match ok {
-        Ok(()) => app.set_status(format!("copied {uri}"), false),
-        Err(e) => app.set_status(format!("copy failed: {e}"), true),
     }
 }
 
