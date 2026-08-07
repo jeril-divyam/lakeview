@@ -103,7 +103,7 @@ secrets need not be stored on disk. `lakeview init` writes the file with mode
 | Key | Action |
 |---|---|
 | `j` `k` / `↓` `↑` | move |
-| `l` `→` `Enter` | expand; at a pane's edge, move focus right; on a file, zoom the preview; in a zoomed `.jsonl`, unfold a record |
+| `l` `→` `Enter` | expand; at a pane's edge, move focus right; on a file, zoom the preview; in a zoomed `.json` or `.jsonl`, unfold a row |
 | `h` `←` `Backspace` | collapse, else go to the parent; at the top level, move focus left, or leave a zoom |
 | `space` | expand / collapse in place, without moving focus |
 | `g` / `G` | first / last entry |
@@ -146,6 +146,42 @@ on to something else by then.
 
 `d` works on files, not prefixes — downloading a whole subtree is a different
 thing, so a directory says so rather than quietly doing nothing.
+
+## JSON
+
+Zooming a `.json` file (`→` on it in the tree) opens it one level down: the
+root's own members, with every object and array inside them folded onto a row
+each and marked `▸`. A file's shape is the thing worth seeing first; the values
+under it are what you go looking for.
+
+```
+╭ daily_rollup.json ─────────────────────────── zoom  ╮
+│                                                     │
+│  1 {                                                │
+│  2   "name": "daily_rollup",                        │
+│  3   "clicks": 2,                                   │
+│  4 ▸ "tags": ["a", "b"],                            │
+│  5 ▾ "meta": {                                      │
+│  6     "pid": 11,                                   │
+│  7   ▸ "nested": {"deep": true}                     │
+│  8   },                                             │
+│  9   "ok": null                                     │
+│ 10 }                                                │
+╰─────────────────────────────────────────────────────╯
+```
+
+`→`, `Enter` or `space` unfolds the selected row a level at a time, and folds it
+back up from its opening row or its closing bracket either way. `←` winds back
+out the way it does in the tree, and leaves the zoom once nothing is left to
+close. The file's own brackets don't fold — collapsing a whole file to `{…}`
+says nothing.
+
+Line numbers count the rows on show, so folding a block renumbers what is under
+it. The document is re-indented from the parsed value, so there is no original
+line number to keep.
+
+The side pane leaves the folding alone and shows the whole file laid flat: at
+that width there is no room to fold anything usefully.
 
 ## JSONL
 
@@ -199,8 +235,8 @@ Mouse support is on by default.
 | right-click | collapse, or go back |
 | wheel over the focused pane | move the selection (the preview follows) |
 | wheel over the other pane | scroll that pane's view only — no focus or selection change |
-| wheel over the preview | scroll the preview, or move the selection in a zoomed `.jsonl` |
-| double-click a zoomed `.jsonl` row | unfold or fold it |
+| wheel over the preview | scroll the preview, or move the selection in a zoomed `.json` / `.jsonl` |
+| double-click a zoomed `.json` / `.jsonl` row | unfold or fold it |
 | click a tab | switch tab |
 
 Capturing the mouse takes over your terminal's click-drag text selection; most
@@ -225,8 +261,9 @@ selection, set `mouse = false` under `[ui]` and everything stays keyboard-driven
 - The zoomed preview wraps long lines, hanging continuations under the content
   so the line numbers stay readable. The side pane lets them overflow instead —
   at that width, wrapping one long JSON string would bury the rest of the file.
-- JSON is re-indented and syntax-coloured, preserving the file's key order. A
-  file too large to fetch whole won't parse, so it renders as plain text.
+- JSON is re-indented and syntax-coloured, preserving the file's key order, and
+  folds a level at a time in the zoom — see below. A file too large to fetch
+  whole won't parse, so it renders as plain text.
 - `.jsonl` and `.ndjson` files unfold record by record — see below.
 - Everything is read-only — lakeview never writes to your lakeFS server. `d` is
   the only thing it writes anywhere, and only to the working directory.

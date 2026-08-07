@@ -1,11 +1,15 @@
-//! The JSONL preview: one folded row per record, unfolding a level at a time.
+//! Folding JSON documents, in the two shapes the preview meets them.
+//!
+//! [`JsonDoc`] is a whole file, opened one level down. [`Doc`] is newline-
+//! delimited records, each folded onto a row of its own. Both unfold a level at
+//! a time over the same [`Open`] tree and the same row vocabulary, and both are
+//! driven through [`Folding`], so the zoom's keys don't care which it has.
 //!
 //! A preview is capped at `preview_bytes`, so unlike the standalone viewer this
-//! is ported from, every record is parsed up front and nothing needs a cache.
+//! is ported from, everything is parsed up front and nothing needs a cache.
 //!
-//! Rows are built in the same `(JsonTok, String)` vocabulary the whole-file JSON
-//! preview uses, so the UI colours both through `Theme::json` and this module
-//! stays free of ratatui.
+//! Rows are built as `(JsonTok, String)` runs, so the UI colours them through
+//! `Theme::json` and this module stays free of ratatui.
 
 use std::collections::HashMap;
 
@@ -358,7 +362,136 @@ fn shape(value: &Value) -> String {
     }
 }
 
-// ── the document ─────────────────────────────────────────────────────────
+// ── driving a document from the zoom ─────────────────────────────────────
+
+/// A zoomed document the cursor can be driven through: rows that fold, a
+/// selection, and a `←` that winds out of whatever is open.
+///
+/// Both document kinds implement it, so the zoom moves, folds and backs out of
+/// either without knowing which one it is showing.
+pub trait Folding {
+    /// Rows currently on show — folding changes this, so it is recomputed.
+    fn rows_len(&self) -> usize;
+    fn cursor(&self) -> usize;
+    fn set_cursor(&mut self, row: usize);
+    /// Unfold or fold whatever `row` heads, and select it.
+    fn toggle_row(&mut self, row: usize);
+    /// `←` — fold what is open, else step out. `false` once nothing is left to
+    /// close, which is the caller's cue to leave the zoom.
+    fn back(&mut self) -> bool;
+
+    fn move_cursor(&mut self, delta: isize) {
+        let last = self.rows_len().saturating_sub(1) as isize;
+        let next = (self.cursor() as isize + delta).clamp(0, last) as usize;
+        self.set_cursor(next);
+    }
+
+    fn select_edge(&mut self, first: bool) {
+        let row = if first {
+            0
+        } else {
+            self.rows_len().saturating_sub(1)
+        };
+        self.set_cursor(row);
+    }
+
+    fn toggle_cursor(&mut self) {
+        self.toggle_row(self.cursor());
+    }
+}
+
+// ── a whole JSON file ────────────────────────────────────────────────────
+
+/// One JSON document, folded a level at a time.
+///
+/// It opens one level down — the root's own members, with everything nested
+/// inside them folded onto a row each. A file's shape is the thing worth seeing
+/// first; the values under it are what you go looking for.
+///
+/// The root brackets themselves don't fold. Collapsing a whole file to `{…}`
+/// says nothing, and `←` at that level is better spent leaving the zoom.
+pub struct JsonDoc {
+    value: Value,
+    open: Open,
+    /// Selected row, indexing `rows()`.
+    pub cursor: usize,
+}
+
+impl JsonDoc {
+    pub fn new(value: Value) -> Self {
+        Self {
+            value,
+            open: Open::default(),
+            cursor: 0,
+        }
+    }
+
+    pub fn rows(&self) -> Vec<Row> {
+        let mut out = Vec::new();
+        write_body(&mut out, &self.value, &self.open);
+        out
+    }
+}
+
+impl Folding for JsonDoc {
+    fn rows_len(&self) -> usize {
+        self.rows().len()
+    }
+
+    fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    fn set_cursor(&mut self, row: usize) {
+        self.cursor = row;
+    }
+
+    fn toggle_row(&mut self, row: usize) {
+        let rows = self.rows();
+        let Some(target) = rows.get(row) else {
+            return;
+        };
+        self.cursor = row;
+        let Some(path) = target.toggle.clone() else {
+            return;
+        };
+        // A container is folded by its closing bracket as readily as by its
+        // opening row; land on the row that survives either way. Paths are
+        // absolute, so the first row carrying this one is that opening row.
+        if let Some(opening) = rows.iter().position(|r| r.toggle.as_ref() == Some(&path)) {
+            self.cursor = opening;
+        }
+        self.open.toggle(&path);
+        self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
+    }
+
+    fn back(&mut self) -> bool {
+        let rows = self.rows();
+        let Some(row) = rows.get(self.cursor) else {
+            return false;
+        };
+
+        // A block that is open closes, from either end.
+        if row.toggle.is_some() && !row.folded {
+            self.toggle_row(self.cursor);
+            return true;
+        }
+
+        // Nothing to close here, so step out to the block this row sits in. At
+        // the document's own level there is no such block, and the zoom gives
+        // way — the root brackets being unfoldable, that is the end of the line.
+        let Some(path) = row.parent.clone() else {
+            return false;
+        };
+        self.cursor = rows
+            .iter()
+            .position(|r| r.toggle.as_ref() == Some(&path))
+            .unwrap_or(self.cursor);
+        true
+    }
+}
+
+// ── the JSONL document ───────────────────────────────────────────────────
 
 pub struct Entry {
     /// The record's text, verbatim — what the side pane shows.
@@ -485,27 +618,24 @@ impl Doc {
         out
     }
 
-    pub fn len(&self) -> usize {
+}
+
+impl Folding for Doc {
+    fn rows_len(&self) -> usize {
         self.rows().len()
     }
 
-    pub fn move_cursor(&mut self, delta: isize) {
-        let last = self.len().saturating_sub(1) as isize;
-        self.cursor = (self.cursor as isize + delta).clamp(0, last) as usize;
+    fn cursor(&self) -> usize {
+        self.cursor
     }
 
-    pub fn select_edge(&mut self, first: bool) {
-        self.cursor = if first {
-            0
-        } else {
-            self.len().saturating_sub(1)
-        };
+    fn set_cursor(&mut self, row: usize) {
+        self.cursor = row;
     }
 
-    /// Unfold or fold whatever `row` heads, and select it. A record's own row
-    /// folds the whole record; a body row folds the container it names, one
-    /// level at a time.
-    pub fn toggle_row(&mut self, row: usize) {
+    /// A record's own row folds the whole record; a body row folds the container
+    /// it names, one level at a time.
+    fn toggle_row(&mut self, row: usize) {
         let rows = self.rows();
         let Some(target) = rows.get(row) else {
             return;
@@ -526,17 +656,12 @@ impl Doc {
             }
             self.entries[entry].open.toggle(&path);
         }
-        self.cursor = self.cursor.min(self.len().saturating_sub(1));
+        self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
     }
 
-    pub fn toggle_cursor(&mut self) {
-        self.toggle_row(self.cursor);
-    }
-
-    /// `←` — ascend, the way it does in the tree: fold what is open, else step
-    /// out to whatever encloses the selection. Returns `false` once there is
-    /// nothing left to close, which is the caller's cue to leave the zoom.
-    pub fn back(&mut self) -> bool {
+    /// Ascends the way it does in the tree, and gives way only once the record
+    /// the cursor sits in is folded back up.
+    fn back(&mut self) -> bool {
         let rows = self.rows();
         let Some(row) = rows.get(self.cursor) else {
             return false;
@@ -549,7 +674,7 @@ impl Doc {
                 return false;
             }
             self.entries[entry].expanded = false;
-            self.cursor = self.cursor.min(self.len().saturating_sub(1));
+            self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
             return true;
         }
 
@@ -659,10 +784,10 @@ mod tests {
         let mut doc = doc(&[r#"{"a":{"b":1}}"#]);
         doc.toggle_row(0);
         doc.toggle_row(2); // unfold "a"
-        assert_eq!(doc.len(), 6);
+        assert_eq!(doc.rows_len(), 6);
         // Row 4 is the `}` that closes "a"; it folds it back up …
         doc.toggle_row(4);
-        assert_eq!(doc.len(), 4);
+        assert_eq!(doc.rows_len(), 4);
         // … and leaves the cursor on the row that stayed behind.
         assert_eq!(doc.cursor, 2);
     }
@@ -673,21 +798,21 @@ mod tests {
         doc.toggle_row(0);
         doc.toggle_row(2);
         doc.toggle_row(3);
-        let deep = doc.len();
+        let deep = doc.rows_len();
 
         doc.toggle_row(2);
-        assert!(doc.len() < deep);
+        assert!(doc.rows_len() < deep);
         doc.toggle_row(2);
-        assert_eq!(doc.len(), deep);
+        assert_eq!(doc.rows_len(), deep);
     }
 
     #[test]
     fn collapsing_a_record_pulls_the_cursor_back_into_range() {
         let mut doc = doc(&[r#"{"a":1,"b":2}"#]);
         doc.toggle_row(0);
-        doc.cursor = doc.len() - 1;
+        doc.cursor = doc.rows_len() - 1;
         doc.toggle_row(0);
-        assert_eq!(doc.len(), 1);
+        assert_eq!(doc.rows_len(), 1);
         assert_eq!(doc.cursor, 0);
     }
 
@@ -721,7 +846,7 @@ mod tests {
         for json in ["42", r#""hi""#, "null", "{}", "[]"] {
             let mut doc = doc(&[json]);
             doc.toggle_row(0);
-            assert_eq!(doc.len(), 2, "{json}");
+            assert_eq!(doc.rows_len(), 2, "{json}");
         }
     }
 
@@ -763,19 +888,19 @@ mod tests {
         assert!(doc.back());
         assert_eq!(doc.cursor, 3);
         assert!(doc.back());
-        assert_eq!(doc.len(), 6, "{:?}", rendered(&doc));
+        assert_eq!(doc.rows_len(), 6, "{:?}", rendered(&doc));
 
         // "b" is folded now, so the next step is out to "a", which folds too.
         assert!(doc.back());
         assert_eq!(doc.cursor, 2);
         assert!(doc.back());
-        assert_eq!(doc.len(), 4);
+        assert_eq!(doc.rows_len(), 4);
 
         // Out of "a" to the record's own row, then the record folds …
         assert!(doc.back());
         assert_eq!(doc.cursor, 0);
         assert!(doc.back());
-        assert_eq!(doc.len(), 1);
+        assert_eq!(doc.rows_len(), 1);
 
         // … and only now is there nothing left to close.
         assert!(!doc.back());
@@ -789,7 +914,7 @@ mod tests {
         // Row 4 is the `}` closing "a".
         doc.cursor = 4;
         assert!(doc.back());
-        assert_eq!(doc.len(), 4);
+        assert_eq!(doc.rows_len(), 4);
         assert_eq!(doc.cursor, 2);
     }
 
@@ -798,11 +923,11 @@ mod tests {
         let mut doc = doc(&[r#"{"a":{"b":{"c":1}}}"#]);
         doc.toggle_row(0);
         doc.toggle_row(2); // unfold "a"; row 3 is the folded "b"
-        let before = doc.len();
+        let before = doc.rows_len();
         doc.cursor = 3;
         assert!(doc.back());
         // "b" stays folded — ← never opens anything.
-        assert_eq!(doc.len(), before);
+        assert_eq!(doc.rows_len(), before);
         assert_eq!(doc.cursor, 2);
     }
 
@@ -821,6 +946,155 @@ mod tests {
         doc.cursor = 3; // the `"b": 2` row inside it
         assert!(doc.back());
         assert_eq!(doc.cursor, 1, "the second record's own row");
+    }
+
+    // ── a whole JSON file ────────────────────────────────────────────────
+
+    fn json(text: &str) -> JsonDoc {
+        JsonDoc::new(serde_json::from_str(text).unwrap())
+    }
+
+    fn json_rendered(doc: &JsonDoc) -> Vec<String> {
+        doc.rows()
+            .iter()
+            .map(|r| r.cells.iter().map(|(_, s)| s.as_str()).collect())
+            .collect()
+    }
+
+    /// What the zoom shows the moment it opens: the root's own members, with
+    /// everything nested under them folded onto a row each.
+    #[test]
+    fn a_json_file_opens_one_level_down() {
+        let doc = json(r#"{"a":1,"b":{"c":2},"d":[1,2]}"#);
+        assert_eq!(
+            json_rendered(&doc),
+            [
+                "{",
+                "  \"a\": 1,",
+                "▸ \"b\": {\"c\": 2},",
+                "▸ \"d\": [1, 2]",
+                "}",
+            ]
+        );
+    }
+
+    #[test]
+    fn unfolding_a_member_reveals_its_own_level_only() {
+        let mut doc = json(r#"{"a":{"b":{"c":1}}}"#);
+        doc.toggle_row(1); // "a"
+        assert_eq!(
+            json_rendered(&doc),
+            ["{", "▾ \"a\": {", "  ▸ \"b\": {\"c\": 1}", "  }", "}"]
+        );
+    }
+
+    /// The document's own brackets fold nothing — collapsing a file to `{…}`
+    /// says nothing, and `←` there is better spent leaving the zoom.
+    #[test]
+    fn the_root_brackets_do_not_fold() {
+        let mut doc = json(r#"{"a":1}"#);
+        let before = doc.rows_len();
+        assert!(doc.rows()[0].toggle.is_none());
+        doc.toggle_row(0);
+        assert_eq!(doc.rows_len(), before);
+    }
+
+    #[test]
+    fn a_json_block_folds_from_its_closing_bracket_too() {
+        let mut doc = json(r#"{"a":{"b":1}}"#);
+        doc.toggle_row(1); // unfold "a"
+        assert_eq!(doc.rows_len(), 5);
+        doc.toggle_row(3); // the `}` closing "a"
+        assert_eq!(doc.rows_len(), 3);
+        assert_eq!(doc.cursor, 1, "the cursor lands on the row that stayed");
+    }
+
+    #[test]
+    fn folding_a_json_block_again_keeps_what_was_open_inside() {
+        let mut doc = json(r#"{"a":{"b":{"c":1}}}"#);
+        doc.toggle_row(1);
+        doc.toggle_row(2);
+        let deep = doc.rows_len();
+
+        doc.toggle_row(1);
+        assert!(doc.rows_len() < deep);
+        doc.toggle_row(1);
+        assert_eq!(doc.rows_len(), deep);
+    }
+
+    /// `←` unwinds a level per press, and only gives way at the document's level.
+    #[test]
+    fn json_back_folds_its_way_out_before_giving_way() {
+        let mut doc = json(r#"{"a":{"b":{"c":1}}}"#);
+        doc.toggle_row(1); // unfold "a"
+        doc.toggle_row(2); // unfold "b"
+
+        // From the scalar inside "b": out to "b", which then folds.
+        doc.cursor = 3;
+        assert!(doc.back());
+        assert_eq!(doc.cursor, 2);
+        assert!(doc.back());
+        assert_eq!(doc.rows_len(), 5, "{:?}", json_rendered(&doc));
+
+        // "b" is folded, so the next step is out to "a", which folds too.
+        assert!(doc.back());
+        assert_eq!(doc.cursor, 1);
+        assert!(doc.back());
+        assert_eq!(doc.rows_len(), 3);
+
+        // Back at the document's own level there is nothing left to close.
+        assert!(!doc.back());
+    }
+
+    #[test]
+    fn json_back_steps_out_of_a_folded_sibling_rather_than_opening_it() {
+        let mut doc = json(r#"{"a":{"b":{"c":1}}}"#);
+        doc.toggle_row(1); // unfold "a"; row 2 is the folded "b"
+        let before = doc.rows_len();
+        doc.cursor = 2;
+        assert!(doc.back());
+        assert_eq!(doc.rows_len(), before, "← never opens anything");
+        assert_eq!(doc.cursor, 1);
+    }
+
+    #[test]
+    fn an_empty_container_says_all_it_has_to_on_one_row() {
+        for text in ["{}", "[]"] {
+            let doc = json(text);
+            assert_eq!(json_rendered(&doc), [text], "{text}");
+            assert!(doc.rows()[0].toggle.is_none());
+        }
+    }
+
+    #[test]
+    fn an_array_root_opens_the_same_way() {
+        let doc = json(r#"[1,{"a":2}]"#);
+        assert_eq!(
+            json_rendered(&doc),
+            ["[", "  1,", "▸ {\"a\": 2}", "]"]
+        );
+        assert_eq!(doc.rows()[2].toggle.as_deref(), Some(&[Seg::Index(1)][..]));
+    }
+
+    #[test]
+    fn the_json_cursor_never_leaves_the_document() {
+        let mut doc = json(r#"{"a":1,"b":2}"#);
+        doc.move_cursor(-5);
+        assert_eq!(doc.cursor, 0);
+        doc.move_cursor(50);
+        assert_eq!(doc.cursor, doc.rows_len() - 1);
+        doc.select_edge(true);
+        assert_eq!(doc.cursor, 0);
+    }
+
+    /// Folding above the cursor can shorten the document under it.
+    #[test]
+    fn folding_pulls_the_json_cursor_back_into_range() {
+        let mut doc = json(r#"{"a":{"b":1,"c":2,"d":3}}"#);
+        doc.toggle_row(1);
+        doc.cursor = doc.rows_len() - 1;
+        doc.toggle_row(1);
+        assert!(doc.cursor < doc.rows_len());
     }
 
     #[test]

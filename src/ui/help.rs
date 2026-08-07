@@ -37,11 +37,13 @@ and ← move focus instead. / in the tree searches recursively, \
 walking into closed directories and opening the path to every match; Esc restores the shape \
 you had open. Set ui.mouse = false to hand the mouse back to your terminal.";
 
-const JSONL: &str = "A zoomed .jsonl lists its records, each folded onto one row. →, Enter \
-or space unfolds the selected one to its top level, then the objects and arrays inside it a \
-level at a time. ← winds back out, folding what is open and stepping out of what is not, and \
-leaves the zoom only once nothing is left to close; Esc leaves at once. Folded rows are \
-truncated — unfolding is how you see the rest — and everything else wraps.";
+const FOLDING: &str = "A zoomed .json opens one level down: the root's own members, with every \
+object and array inside them folded onto a row each. A zoomed .jsonl folds one step further, \
+listing its records a row apiece. →, Enter or space unfolds the selected row a level at a time, \
+and folds it back up from its opening row or its closing bracket either way. ← winds back out, \
+folding what is open and stepping out of what is not, and leaves the zoom only once nothing is \
+left to close; Esc leaves at once. Folded rows are truncated — unfolding is how you see the rest \
+— and everything else wraps.";
 
 const MOUSE: &[(&str, &str)] = &[
     ("click", "focus the pane, select the row"),
@@ -65,7 +67,7 @@ pub fn draw(frame: &mut Frame, area: Rect) {
         Constraint::Min(3),
     ])
     .areas(left);
-    let [actions, jsonl, config] = Layout::vertical([
+    let [actions, folding, config] = Layout::vertical([
         Constraint::Length(10),
         Constraint::Min(4),
         Constraint::Min(4),
@@ -84,10 +86,10 @@ pub fn draw(frame: &mut Frame, area: Rect) {
     );
 
     frame.render_widget(
-        Paragraph::new(Text::styled(JSONL, Theme::dim()))
+        Paragraph::new(Text::styled(FOLDING, Theme::dim()))
             .wrap(Wrap { trim: false })
-            .block(panel("JSONL")),
-        jsonl,
+            .block(panel("Folding")),
+        folding,
     );
 
     frame.render_widget(

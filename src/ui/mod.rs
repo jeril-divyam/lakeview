@@ -183,6 +183,15 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let hints: &[(&str, &str)] = match (app.tab, &app.mode) {
         (_, Mode::Filter) => &[("type", "filter"), ("Enter", "apply"), ("Esc", "clear")],
         (_, Mode::Profiles(_)) => &[("↑↓/jk", "move"), ("Enter", "switch"), ("Esc", "cancel")],
+        // A zoomed JSON or JSONL file has rows to fold; anything else zoomed is
+        // a flat body, where the same keys only move the view.
+        (_, Mode::Zoom) if app.zoom_doc().is_some() => &[
+            ("↑↓/jk", "move"),
+            ("→/space", "unfold"),
+            ("←/h", "fold"),
+            ("Esc", "leave"),
+            ("d", "download"),
+        ],
         (_, Mode::Zoom) => &[("↑↓/jk", "scroll"), ("Esc/h", "back"), ("d", "download")],
         (Tab::Browse, _) => &[
             ("↑↓/jk", "move"),

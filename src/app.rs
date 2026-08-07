@@ -20,6 +20,7 @@ use ratatui::widgets::ListState;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::{Config, Profile};
+use crate::jsonl::Folding;
 use crate::lakefs::{Client, Commit, NamedRef, ObjectStats, RefKind, Repository};
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -541,7 +542,14 @@ pub struct Preview {
 pub enum PreviewBody {
     Text(Vec<String>),
     /// Re-indented JSON, tokenised so the UI can colour it.
-    Json(Vec<JsonLine>),
+    ///
+    /// Two renderings of one value: `lines` is the whole thing laid flat, which
+    /// is all the side pane has room to say, and `doc` folds. Built once here
+    /// rather than per frame, and bounded by `preview_bytes` either way.
+    Json {
+        lines: Vec<JsonLine>,
+        doc: crate::jsonl::JsonDoc,
+    },
     /// Newline-delimited JSON, one foldable record per row. The side pane still
     /// renders it as plain text; only the zoom unfolds it.
     Jsonl(crate::jsonl::Doc),
@@ -743,9 +751,8 @@ impl App {
             .map(|(repo, reference)| (repo.as_str(), reference.as_str()))
     }
 
-    /// The zoomed JSONL document, when that is what is on screen. Folding is a
-    /// zoom-only affair: the side pane is too narrow to read records in, and
-    /// shows them as plain text instead.
+    /// The zoomed JSONL document, when that is what is on screen. Only the
+    /// `truncated` mark is particular to it; folding goes through `zoom_doc`.
     pub fn jsonl(&self) -> Option<&crate::jsonl::Doc> {
         match (&self.mode, &self.preview.body) {
             (Mode::Zoom, Some(PreviewBody::Jsonl(doc))) => Some(doc),
@@ -753,9 +760,23 @@ impl App {
         }
     }
 
-    fn jsonl_mut(&mut self) -> Option<&mut crate::jsonl::Doc> {
+    /// The foldable document the zoom is showing, of either kind.
+    ///
+    /// Folding is a zoom-only affair. The side pane is too narrow to read a
+    /// folded row in — a JSON file gets its flat pretty-print there, and JSONL
+    /// the plain lines it is.
+    pub fn zoom_doc(&self) -> Option<&dyn Folding> {
+        match (&self.mode, &self.preview.body) {
+            (Mode::Zoom, Some(PreviewBody::Jsonl(doc))) => Some(doc),
+            (Mode::Zoom, Some(PreviewBody::Json { doc, .. })) => Some(doc),
+            _ => None,
+        }
+    }
+
+    fn zoom_doc_mut(&mut self) -> Option<&mut dyn Folding> {
         match (&self.mode, &mut self.preview.body) {
             (Mode::Zoom, Some(PreviewBody::Jsonl(doc))) => Some(doc),
+            (Mode::Zoom, Some(PreviewBody::Json { doc, .. })) => Some(doc),
             _ => None,
         }
     }
@@ -1517,7 +1538,7 @@ impl App {
             }
             // A zoomed JSONL preview has rows to move between; anything else
             // zoomed is a flat body, and moves the view itself.
-            _ if self.mode == Mode::Zoom => match self.jsonl_mut() {
+            _ if self.mode == Mode::Zoom => match self.zoom_doc_mut() {
                 Some(doc) => doc.move_cursor(delta),
                 None => {
                     self.preview.scroll = self
@@ -1544,7 +1565,7 @@ impl App {
 
     pub fn select_edge(&mut self, first: bool) {
         if self.mode == Mode::Zoom {
-            match self.jsonl_mut() {
+            match self.zoom_doc_mut() {
                 Some(doc) => doc.select_edge(first),
                 // The render clamps this to the body's real height, which is
                 // the only place the wrapped line count is known.
@@ -1604,7 +1625,7 @@ impl App {
         // Already zoomed: descending means unfolding the selected record, and
         // there is nothing else left to open.
         if self.mode == Mode::Zoom {
-            if let Some(doc) = self.jsonl_mut() {
+            if let Some(doc) = self.zoom_doc_mut() {
                 doc.toggle_cursor();
             }
             return;
@@ -1656,7 +1677,7 @@ impl App {
         if self.mode == Mode::Zoom {
             // A zoomed JSONL folds its way out a level at a time; the zoom is
             // only what `←` leaves once nothing is left open.
-            if let Some(doc) = self.jsonl_mut()
+            if let Some(doc) = self.zoom_doc_mut()
                 && doc.back()
             {
                 return;
@@ -1703,7 +1724,7 @@ impl App {
     /// `space` — expand or collapse in place, without moving focus.
     pub fn toggle(&mut self) {
         if self.mode == Mode::Zoom {
-            if let Some(doc) = self.jsonl_mut() {
+            if let Some(doc) = self.zoom_doc_mut() {
                 doc.toggle_cursor();
             }
             return;
@@ -1850,7 +1871,7 @@ impl App {
         if self.mode == Mode::Zoom || self.hits.preview.is_some_and(|a| Hits::hit(a, col, row)) {
             // A zoomed JSONL preview is the focused list, so the wheel moves its
             // selection the way it does in any other focused pane.
-            if self.jsonl().is_some() {
+            if self.zoom_doc().is_some() {
                 self.move_selection(delta);
                 return;
             }
@@ -1922,15 +1943,15 @@ impl App {
 
         // A zoomed JSONL preview: select the record under the pointer, and
         // unfold it on the second click, as a double-click does everywhere else.
-        if self.jsonl().is_some()
+        if self.zoom_doc().is_some()
             && let Some(area) = self.hits.preview
             && Hits::hit(area, col, row)
         {
             let Some(&line) = self.hits.preview_rows.get((row - area.y) as usize) else {
                 return;
             };
-            if let Some(doc) = self.jsonl_mut() {
-                doc.cursor = line;
+            if let Some(doc) = self.zoom_doc_mut() {
+                doc.set_cursor(line);
                 if double {
                     doc.toggle_row(line);
                 }
@@ -2176,7 +2197,10 @@ fn render_body(path: &str, bytes: &[u8], truncated: bool) -> PreviewBody {
     {
         let mut lines = Vec::new();
         write_json(&value, 0, None, false, &mut lines);
-        return PreviewBody::Json(lines);
+        return PreviewBody::Json {
+            lines,
+            doc: crate::jsonl::JsonDoc::new(value),
+        };
     }
 
     PreviewBody::Text(text.lines().map(|l| l.replace('\t', "    ")).collect())

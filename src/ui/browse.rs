@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{format_ts, human_size, justify, truncate};
 use crate::app::{App, Focus, Load, Mode, PreviewBody, ReposRow, ReposView, RowKind, TreeView};
-use crate::jsonl::DocRow;
+use crate::jsonl::{DocRow, Row as JsonRow};
 use crate::theme::Theme;
 
 /// Floors the configured widths are held to, so no ratio can squeeze a pane
@@ -385,10 +385,10 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, zoomed: bool) -> Re
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // A zoomed JSONL preview is a list of its own, with a selection and rows to
-    // unfold, so it draws itself rather than flattening to a paragraph.
-    if zoomed && app.jsonl().is_some() {
-        draw_jsonl(frame, app, inner);
+    // A zoomed foldable document is a list of its own, with a selection and rows
+    // to unfold, so it draws itself rather than flattening to a paragraph.
+    if zoomed && app.zoom_doc().is_some() {
+        draw_zoom(frame, app, inner);
         return inner;
     }
 
@@ -425,15 +425,16 @@ fn clamp_scroll(scroll: u16, lines: usize, height: u16) -> u16 {
     scroll.min(max.min(u16::MAX as usize) as u16)
 }
 
-// ── the zoomed JSONL view ────────────────────────────────────────────────
+// ── the zoomed foldable view ─────────────────────────────────────────────
 
-/// One record per row, each unfolding a level at a time.
+/// A folded document, one row per record or per JSON member, each unfolding a
+/// level at a time.
 ///
 /// A row showing a folded value is truncated rather than wrapped — unfolding it
-/// is how you see the rest, and wrapping a whole record over ten lines would
-/// bury the records under it. Everything else wraps, so the long string values
-/// an unfolded record exposes can be read at full width.
-fn draw_jsonl(frame: &mut Frame, app: &mut App, area: Rect) {
+/// is how you see the rest, and wrapping one row over ten lines would bury the
+/// rows under it. Everything else wraps, so the long string values an unfolded
+/// container exposes can be read at full width.
+fn draw_zoom(frame: &mut Frame, app: &mut App, area: Rect) {
     let (width, height) = (area.width as usize, area.height as usize);
     if width == 0 || height == 0 {
         return;
@@ -441,18 +442,14 @@ fn draw_jsonl(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Take everything the layout needs by value, so the doc isn't still
     // borrowed when the scroll and the hit map are written back.
-    let Some((rows, cursor, gutter)) = app.jsonl().map(|doc| {
-        let rows = doc.rows();
-        let cursor = doc.cursor.min(rows.len().saturating_sub(1));
-        (rows, cursor, doc.entries.len().to_string().len().max(2))
-    }) else {
+    let Some((rows, cursor)) = zoom_rows(app) else {
         return;
     };
     if rows.is_empty() {
-        frame.render_widget(centered_note("no records", Theme::faint()), area);
+        frame.render_widget(centered_note("nothing to show", Theme::faint()), area);
         return;
     }
-    let lines = jsonl_layout(&rows, gutter, cursor, width);
+    let lines = zoom_layout(rows, cursor, width);
     let first = lines.iter().position(|(r, _)| *r == cursor).unwrap_or(0);
     let last = lines
         .iter()
@@ -470,21 +467,51 @@ fn draw_jsonl(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// The styled rows of whichever foldable document the zoom has, each paired with
+/// whether it is folded, plus the cursor held inside the document.
+///
+/// The two kinds differ only in their gutter: a JSONL row is numbered by the
+/// record it belongs to, a JSON row by its own place in the document.
+fn zoom_rows(app: &App) -> Option<(Vec<(Line<'static>, bool)>, usize)> {
+    match &app.preview.body {
+        Some(PreviewBody::Jsonl(doc)) => {
+            let rows = doc.rows();
+            let cursor = doc.cursor.min(rows.len().saturating_sub(1));
+            let gutter = doc.entries.len().to_string().len().max(2);
+            let lit = rows.get(cursor).map(|r| r.entry);
+            let lines = rows
+                .iter()
+                .map(|r| (jsonl_line(r, gutter, Some(r.entry) == lit), r.folded))
+                .collect();
+            Some((lines, cursor))
+        }
+        Some(PreviewBody::Json { doc, .. }) => {
+            let rows = doc.rows();
+            let cursor = doc.cursor.min(rows.len().saturating_sub(1));
+            let gutter = rows.len().to_string().len().max(2);
+            let lines = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (json_line(r, i + 1, gutter), r.folded))
+                .collect();
+            Some((lines, cursor))
+        }
+        _ => None,
+    }
+}
+
 /// Lay every row out into the screen lines it occupies, each tagged with the row
 /// it came from. Everything is laid out, not just what is on screen: the cursor
 /// cannot be revealed, nor the view held to the end of the body, without knowing
 /// how tall the rows above it are.
-fn jsonl_layout(
-    rows: &[DocRow],
-    gutter: usize,
+fn zoom_layout(
+    rows: Vec<(Line<'static>, bool)>,
     cursor: usize,
     width: usize,
 ) -> Vec<(usize, Line<'static>)> {
-    let cursor_entry = rows.get(cursor).map(|r| r.entry);
     let mut out = Vec::with_capacity(rows.len());
-    for (i, row) in rows.iter().enumerate() {
-        let line = jsonl_line(row, gutter, Some(row.entry) == cursor_entry);
-        let laid_out = if row.folded {
+    for (i, (line, folded)) in rows.into_iter().enumerate() {
+        let laid_out = if folded {
             vec![truncate_line(line, width)]
         } else {
             let indent = hanging_indent(&line);
@@ -547,6 +574,22 @@ fn jsonl_line(row: &DocRow, gutter: usize, lit: bool) -> Line<'static> {
             Theme::faint(),
         ));
     }
+    spans.extend(
+        row.cells
+            .iter()
+            .map(|(tok, text)| Span::styled(text.clone(), Theme::json(*tok))),
+    );
+    Line::from(spans)
+}
+
+/// A row of a whole JSON file: its line number, then the row's coloured cells.
+///
+/// The number counts rows on show rather than lines of the file, so folding a
+/// block renumbers what is under it — there is no original line to keep, the
+/// document being re-indented from the parsed value in the first place.
+fn json_line(row: &JsonRow, number: usize, gutter: usize) -> Line<'static> {
+    let mut spans = Vec::with_capacity(row.cells.len() + 1);
+    spans.push(Span::styled(format!("{number:>gutter$} "), Theme::faint()));
     spans.extend(
         row.cells
             .iter()
@@ -826,7 +869,7 @@ fn preview_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         Some(PreviewBody::Text(rows)) if rows.is_empty() => {
             lines.push(Line::styled("empty file", Theme::faint()));
         }
-        Some(PreviewBody::Json(rows)) => {
+        Some(PreviewBody::Json { lines: rows, .. }) => {
             let gutter = rows.len().to_string().len().max(2);
             for (i, row) in rows.iter().enumerate() {
                 let mut spans = vec![Span::styled(format!("{:>gutter$} ", i + 1), Theme::faint())];
@@ -872,6 +915,7 @@ fn kv(key: &str, value: &str, style: Style) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jsonl::Folding;
 
     /// Flatten a rendered line back to plain text, for comparison.
     fn text(line: &Line) -> String {
@@ -1028,8 +1072,17 @@ mod tests {
         assert_eq!(text(&jsonl_line(&body, 3, false)), "    │ {");
     }
 
+    /// The JSONL rows a doc lays out to, as `draw_zoom` would build them.
+    fn jsonl_rows(doc: &crate::jsonl::Doc) -> Vec<(Line<'static>, bool)> {
+        let lit = doc.rows().get(doc.cursor).map(|r| r.entry);
+        doc.rows()
+            .iter()
+            .map(|r| (jsonl_line(r, 2, Some(r.entry) == lit), r.folded))
+            .collect()
+    }
+
     fn laid_out(doc: &crate::jsonl::Doc, width: usize) -> Vec<String> {
-        jsonl_layout(&doc.rows(), 2, doc.cursor, width)
+        zoom_layout(jsonl_rows(doc), doc.cursor, width)
             .iter()
             .map(|(_, line)| text(line))
             .collect()
@@ -1079,7 +1132,7 @@ mod tests {
         let mut doc = crate::jsonl::parse(&format!("{raw}\n{raw}\n"), false);
         doc.toggle_row(0);
         let rows = doc.rows();
-        let lines = jsonl_layout(&rows, 2, doc.cursor, 40);
+        let lines = zoom_layout(jsonl_rows(&doc), doc.cursor, 40);
         // Monotonic, starting at 0, and never naming a row that isn't there.
         assert_eq!(lines[0].0, 0);
         assert!(lines.windows(2).all(|w| w[1].0 == w[0].0 || w[1].0 == w[0].0 + 1));
@@ -1108,13 +1161,8 @@ mod tests {
         assert_eq!(reveal(5, 2, 3, 20, 8), 0);
     }
 
-    /// Drives the real draw path — pane frame, layout, clipping and all — over
-    /// a JSONL preview, which the pure-function tests above never touch.
-    #[tokio::test]
-    async fn the_zoomed_view_draws_what_the_cursor_is_on() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
+    /// An app with nothing loaded, for driving the draw path.
+    fn test_app() -> App {
         let profile = crate::config::Profile {
             // Nothing is fetched; the client only has to exist.
             endpoint: "http://127.0.0.1:1".into(),
@@ -1128,13 +1176,80 @@ mod tests {
         };
         let client = crate::lakefs::Client::new(&profile, 500).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(
+        App::new(
             crate::config::Config::default(),
             "test".into(),
             profile,
             client,
             tx,
-        );
+        )
+    }
+
+    /// Draw into a test terminal and read the screen back as trimmed rows.
+    fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A JSON file zoomed: the whole draw path, over the shape the zoom opens
+    /// with — the root's members, everything under them folded.
+    #[tokio::test]
+    async fn a_zoomed_json_file_draws_one_level_open() {
+        let mut app = test_app();
+        let value: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":{"c":2}}"#).unwrap();
+        app.preview.body = Some(PreviewBody::Json {
+            // Only the zoom is under test; the flat lines are the side pane's.
+            lines: Vec::new(),
+            doc: crate::jsonl::JsonDoc::new(value),
+        });
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+
+        let all = render(&mut app, 60, 12).join("\n");
+        assert!(all.contains("\"a\": 1,"), "{all}");
+        // "b" is a container, so it stays folded onto a row behind its marker.
+        assert!(all.contains(r#"▸ "b": {"c": 2}"#), "{all}");
+        assert!(all.contains(" zoom "), "{all}");
+
+        // `→` on that row unfolds it, to its own level and no further.
+        app.move_selection(2);
+        app.open();
+        let all = render(&mut app, 60, 12).join("\n");
+        assert!(all.contains(r#"▾ "b": {"#), "{all}");
+        assert!(all.contains("\"c\": 2"), "{all}");
+
+        // `←` folds it straight back up.
+        app.back();
+        let all = render(&mut app, 60, 12).join("\n");
+        assert!(all.contains(r#"▸ "b": {"c": 2}"#), "{all}");
+        assert_eq!(app.mode, Mode::Zoom, "folding is not leaving");
+    }
+
+    /// Drives the real draw path — pane frame, layout, clipping and all — over
+    /// a JSONL preview, which the pure-function tests above never touch.
+    #[tokio::test]
+    async fn the_zoomed_view_draws_what_the_cursor_is_on() {
+        // Drawn here rather than through `render`, which drops the buffer the
+        // selection-background checks below need.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app();
 
         let mut doc = crate::jsonl::parse("{\"a\":1}\n{\"b\":{\"c\":2}}\n", false);
         doc.cursor = 1;
