@@ -21,6 +21,7 @@ const NAVIGATION: &[(&str, &str)] = &[
 const ACTIONS: &[(&str, &str)] = &[
     ("/", "search the focused pane"),
     ("Esc", "clear the search / leave zoom"),
+    ("F", "filter the keys a .jsonl shows"),
     ("d", "download the selected file"),
     ("r", "reload the focused pane"),
     ("p", "switch profile"),
@@ -43,7 +44,9 @@ listing its records a row apiece. →, Enter or space unfolds the selected row a
 and folds it back up from its opening row or its closing bracket either way. ← winds back out, \
 folding what is open and stepping out of what is not, and leaves the zoom only once nothing is \
 left to close; Esc leaves at once. Folded rows are truncated — unfolding is how you see the rest \
-— and everything else wraps.";
+— and everything else wraps. F over a zoomed .jsonl opens a menu of the keys its records use, \
+each switchable: space switches one, ← → fold the tree, a/n switch all or none, Enter applies and \
+Esc puts the old filter back.";
 
 const MOUSE: &[(&str, &str)] = &[
     ("click", "focus the pane, select the row"),
@@ -61,14 +64,19 @@ pub fn draw(frame: &mut Frame, area: Rect) {
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
 
+    // Each table asks for its rows plus its borders and top padding. A table
+    // given less than that quietly loses its last key, which is the one nobody
+    // then knows about.
+    let table_height = |rows: &[(&str, &str)]| Constraint::Length(rows.len() as u16 + 3);
+
     let [nav, mouse, about] = Layout::vertical([
-        Constraint::Length(9),
-        Constraint::Length(6),
+        table_height(NAVIGATION),
+        table_height(MOUSE),
         Constraint::Min(3),
     ])
     .areas(left);
     let [actions, folding, config] = Layout::vertical([
-        Constraint::Length(10),
+        table_height(ACTIONS),
         Constraint::Min(4),
         Constraint::Min(4),
     ])
@@ -138,4 +146,33 @@ fn panel(title: &str) -> Block<'static> {
             Span::styled(title.to_string(), Theme::title(false)),
             Span::raw(" "),
         ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key nobody can see is a key nobody knows about, so every row of every
+    /// table has to survive the layout.
+    #[test]
+    fn every_key_is_drawn() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        terminal.draw(|frame| draw(frame, frame.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for (key, _) in NAVIGATION.iter().chain(ACTIONS).chain(MOUSE) {
+            assert!(screen.contains(key), "{key} is not on the help screen");
+        }
+    }
 }

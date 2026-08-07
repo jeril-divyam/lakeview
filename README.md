@@ -109,6 +109,7 @@ secrets need not be stored on disk. `lakeview init` writes the file with mode
 | `g` / `G` | first / last entry |
 | `Ctrl-d` / `Ctrl-u` | half-page down / up |
 | `/` | search the focused pane (`Esc` clears) |
+| `F` | in a zoomed `.jsonl`, filter which keys the records show |
 | `d` | download the selected file into the working directory |
 | `r` | reload the focused pane |
 | `p` | switch profile |
@@ -213,18 +214,42 @@ either way, and what was open inside it is remembered.
 to the enclosing block when there is nothing there to fold, and only once the
 whole record is folded again does it leave the zoom. `Esc` leaves at once.
 
-A folded row is truncated rather than wrapped — unfolding it is how you see the
-rest, and re-flowing one record over ten lines would bury the records under it.
-Everything else wraps, so the long values an unfolded record exposes are
-readable at full width.
+### Filtering keys
 
-The side pane doesn't fold — at that width there is no room to usefully — but it
-gives each record a line, syntax-coloured like the JSON preview beside it. The
-records are re-spaced to be coloured at all, so what it shows is the JSON each
-line holds rather than its exact bytes; the zoom is the same. A record that isn't
-valid JSON keeps its raw text, in red with the parse error beside it, and unfolds
-to show the message and the text. Records lost to the `preview_bytes` cap are
-marked `truncated` in the pane's title rather than shown half-read.
+Wide records are mostly noise more often than not. `F` opens a menu of the keys
+the file's records use, as a tree that unfolds one level at a time, and each key
+can be switched off:
+
+```
+╭ Filter keys ─────────────────────────────────────────────╮
+│                                                          │
+│   [x] level                                              │
+│   [x] msg                                                │
+│ ▾ [~] meta                                               │
+│     [x] pid                                              │
+│     [ ] tags                                             │
+│                                                          │
+╰ space on/off  ←→ fold  a/n all/none  ⏎ apply  esc cancel ╯
+```
+
+`space` (or a click) switches the selected key, `←`/`→` fold and unfold a level,
+`a`/`n` switch all or none, `Enter` closes the menu and `Esc` puts the old filter
+back. The records change behind the menu as you switch keys, so what you are
+choosing is on show while you choose it.
+
+Switching a key off takes everything nested under it with it, and switching one
+back on clears the way down to it, so a `[x]` always means a key you will
+actually see. A `[~]` means the key is shown but is hiding something below it.
+
+Switched-off keys are gone from the folded previews, the unfolded bodies and the
+side pane's lines alike, and the pane's title keeps count of how many. Nothing is
+re-fetched or re-read to do it, so switching a key back on brings it straight
+back. The menu is built from the first 500 records of the preview, so a key that
+first appears after those is never hidden.
+
+The filter belongs to the file you are looking at: moving to another object and
+back starts clean. Only `.jsonl` has one — a whole `.json` file is a single value
+rather than a shape repeated, so there is no set of keys worth switching off.
 
 ## Mouse
 
@@ -239,6 +264,8 @@ Mouse support is on by default.
 | wheel over the other pane | scroll that pane's view only — no focus or selection change |
 | wheel over the preview | scroll the preview, or move the selection in a zoomed `.json` / `.jsonl` |
 | double-click a zoomed `.json` / `.jsonl` row | unfold or fold it |
+| click a key in the `F` menu | switch it on or off |
+| click away from that menu | close it, keeping the switches |
 | click a tab | switch tab |
 
 Capturing the mouse takes over your terminal's click-drag text selection; most
@@ -266,6 +293,7 @@ selection, set `mouse = false` under `[ui]` and everything stays keyboard-driven
 - JSON is re-indented and syntax-coloured, preserving the file's key order, and
   folds a level at a time in the zoom — see below. A file too large to fetch
   whole won't parse, so it renders as plain text.
-- `.jsonl` and `.ndjson` files unfold record by record — see below.
+- `.jsonl` and `.ndjson` files unfold record by record, and `F` switches off the
+  keys you don't want to read — see below.
 - Everything is read-only — lakeview never writes to your lakeFS server. `d` is
   the only thing it writes anywhere, and only to the working directory.

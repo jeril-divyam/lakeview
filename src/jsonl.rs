@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::app::JsonTok;
+use crate::keys::KeyFilter;
 
 /// Columns of a folded value worth building. The pane truncates to its own
 /// width; this only has to be wider than any terminal is.
@@ -494,9 +495,13 @@ impl Folding for JsonDoc {
 // ── the JSONL document ───────────────────────────────────────────────────
 
 pub struct Entry {
-    /// The record's text, verbatim — what the side pane shows.
+    /// The record's text, verbatim.
     pub raw: String,
     value: Option<Value>,
+    /// The value with the filtered-out keys dropped, when the filter hides any.
+    /// Pruning once per edit rather than once per frame keeps every row cheap,
+    /// and leaves `value` intact for a filter that is switched back on.
+    view: Option<Value>,
     /// The parse failure, when this record is not valid JSON.
     error: Option<String>,
     expanded: bool,
@@ -512,10 +517,18 @@ impl Entry {
         Self {
             raw,
             value,
+            view: None,
             error,
             expanded: false,
             open: Open::default(),
         }
+    }
+
+    /// The value as it should be shown: pruned when the filter hides anything.
+    /// Everything that renders a record goes through here, so no caller has to
+    /// know that filtering exists.
+    fn shown(&self) -> Option<&Value> {
+        self.view.as_ref().or(self.value.as_ref())
     }
 
     /// The record's own row: its folded preview, or a shape hint once the body
@@ -529,7 +542,7 @@ impl Entry {
         };
         let mut cells = vec![(marker_tok, marker.to_string())];
 
-        match (&self.value, &self.error) {
+        match (self.shown(), &self.error) {
             (_, Some(_)) if self.expanded => cells.push((JsonTok::Null, "err".into())),
             (_, Some(err)) => {
                 cells.push((JsonTok::Error, self.raw.clone()));
@@ -551,8 +564,12 @@ impl Entry {
     /// The text is re-spaced by `compact` rather than kept verbatim, which is
     /// what lets it be coloured at all, and matches the whole-file JSON preview
     /// beside it. A record that doesn't parse keeps its raw text and its error.
+    ///
+    /// Keys switched off in the zoom's filter are gone from here too — the pane
+    /// and the zoom share one document, and a line that still showed them would
+    /// contradict the view it belongs to.
     pub fn line(&self) -> Cells {
-        match (&self.value, &self.error) {
+        match (self.shown(), &self.error) {
             (_, Some(err)) => vec![
                 (JsonTok::Error, self.raw.clone()),
                 (JsonTok::Null, format!("   ({err})")),
@@ -570,19 +587,23 @@ impl Entry {
             ];
         }
         let mut out = Vec::new();
-        if let Some(value) = &self.value {
+        if let Some(value) = self.shown() {
             write_body(&mut out, value, &self.open);
         }
         out
     }
 }
 
+/// A file of newline-delimited records, each folding on its own, and the key
+/// filter they are all shown through.
 pub struct Doc {
     pub entries: Vec<Entry>,
     /// Selected row, indexing `rows()`.
     pub cursor: usize,
     /// The fetch stopped at `preview_bytes`, so this is not the whole file.
     pub truncated: bool,
+    /// Which of the records' keys are shown, edited through the zoom's menu.
+    filter: KeyFilter,
 }
 
 /// Split `text` into records. A capped fetch usually stops mid-record, so the
@@ -593,15 +614,19 @@ pub fn parse(text: &str, truncated: bool) -> Doc {
     if truncated && !text.ends_with('\n') {
         lines.pop();
     }
-    let entries = lines
+    let entries: Vec<Entry> = lines
         .into_iter()
         .filter(|line| !line.trim().is_empty())
         .map(|line| Entry::new(line.to_string()))
         .collect();
+    // The records are parsed already, so the key structure costs a walk over
+    // values rather than a second pass over the text.
+    let filter = KeyFilter::discover(entries.iter().filter_map(|e| e.value.as_ref()));
     Doc {
         entries,
         cursor: 0,
         truncated,
+        filter,
     }
 }
 
@@ -636,6 +661,41 @@ impl Doc {
         out
     }
 
+    pub fn keys(&self) -> &KeyFilter {
+        &self.filter
+    }
+
+    /// Edit which keys are shown, and re-prune every record with the result.
+    ///
+    /// Pruning here, once, is what lets `header`, `body` and `line` stay
+    /// ignorant of filtering. The cursor is pulled back in afterwards: hiding a
+    /// key can shorten an unfolded record out from under it.
+    pub fn edit_keys(&mut self, edit: impl FnOnce(&mut KeyFilter)) {
+        edit(&mut self.filter);
+        let filter = &self.filter;
+        let hiding = filter.hidden() > 0;
+        for entry in &mut self.entries {
+            entry.view = match (&entry.value, hiding) {
+                (Some(value), true) => {
+                    let mut pruned = value.clone();
+                    filter.prune(&mut pruned);
+                    Some(pruned)
+                }
+                // Nothing hidden: the parsed value is what to show, and holding
+                // a copy of it would only be a copy.
+                _ => None,
+            };
+        }
+        self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
+    }
+
+    /// Unfold or fold a key in the menu, reporting whether anything moved. Kept
+    /// apart from `edit_keys` because the menu's own shape changes nothing about
+    /// what the records show, and re-pruning the file to fold a row would be
+    /// work for nothing.
+    pub fn fold_keys(&mut self, path: &[usize], open: bool) -> bool {
+        self.filter.set_open(path, open)
+    }
 }
 
 impl Folding for Doc {
@@ -732,6 +792,11 @@ mod tests {
             .iter()
             .map(|r| r.cells.iter().map(|(_, s)| s.as_str()).collect())
             .collect()
+    }
+
+    /// One record as the side pane draws it.
+    fn line(entry: &Entry) -> String {
+        entry.line().iter().map(|(_, s)| s.as_str()).collect()
     }
 
     #[test]
@@ -1155,5 +1220,84 @@ mod tests {
         assert_eq!(doc.cursor, 1);
         doc.select_edge(true);
         assert_eq!(doc.cursor, 0);
+    }
+
+    // ── the key filter ───────────────────────────────────────────────────
+
+    /// The path of the menu row for `key`, as far as the menu is unfolded.
+    fn key_path(doc: &Doc, key: &str) -> Vec<usize> {
+        doc.keys()
+            .rows()
+            .into_iter()
+            .find(|r| r.key == key)
+            .unwrap_or_else(|| panic!("no menu row for {key}"))
+            .path
+    }
+
+    #[test]
+    fn the_key_structure_is_learnt_from_the_records() {
+        let doc = doc(&[r#"{"a":1}"#, r#"{"b":2}"#]);
+        let keys: Vec<String> = doc.keys().rows().into_iter().map(|r| r.key).collect();
+        assert_eq!(keys, ["a", "b"]);
+    }
+
+    #[test]
+    fn a_switched_off_key_is_gone_from_every_row_it_had() {
+        let mut doc = doc(&[r#"{"a":1,"b":2}"#]);
+        doc.toggle_row(0); // unfold the record
+        assert_eq!(
+            rendered(&doc),
+            [r#"▾ {2}"#, "{", r#"  "a": 1,"#, r#"  "b": 2"#, "}"]
+        );
+
+        let path = key_path(&doc, "b");
+        doc.edit_keys(|f| f.toggle(&path));
+        assert_eq!(rendered(&doc), [r#"▾ {1}"#, "{", r#"  "a": 1"#, "}"]);
+        // And from the line the side pane draws.
+        assert_eq!(line(&doc.entries[0]), r#"{"a": 1}"#);
+    }
+
+    /// The record is not re-read to filter it, so switching a key back on has
+    /// to bring the value back exactly as it was.
+    #[test]
+    fn switching_a_key_back_on_restores_it() {
+        let mut doc = doc(&[r#"{"a":1,"b":{"c":2}}"#]);
+        let path = key_path(&doc, "b");
+        doc.edit_keys(|f| f.toggle(&path));
+        assert_eq!(line(&doc.entries[0]), r#"{"a": 1}"#);
+        doc.edit_keys(|f| f.toggle(&path));
+        assert_eq!(line(&doc.entries[0]), r#"{"a": 1, "b": {"c": 2}}"#);
+    }
+
+    #[test]
+    fn a_record_that_does_not_parse_is_left_alone_by_the_filter() {
+        let mut doc = doc(&[r#"{"a":1}"#, "oops"]);
+        let path = key_path(&doc, "a");
+        doc.edit_keys(|f| f.toggle(&path));
+        assert!(line(&doc.entries[1]).starts_with("oops"));
+    }
+
+    /// Hiding a key shortens the record it was in, and the cursor has to come
+    /// back with it rather than point past the end.
+    #[test]
+    fn filtering_pulls_the_cursor_back_into_range() {
+        let mut doc = doc(&[r#"{"a":1,"b":2,"c":3}"#]);
+        doc.toggle_row(0);
+        doc.cursor = doc.rows_len() - 1;
+        let path = key_path(&doc, "b");
+        doc.edit_keys(|f| f.toggle(&path));
+        assert!(doc.cursor < doc.rows_len());
+    }
+
+    /// Folding the menu is a menu affair; it must not disturb the records.
+    #[test]
+    fn folding_the_menu_shows_nothing_new_and_hides_nothing() {
+        let mut doc = doc(&[r#"{"a":{"b":1}}"#]);
+        let before = rendered(&doc);
+        let path = key_path(&doc, "a");
+        assert!(doc.fold_keys(&path, true));
+        assert!(!doc.fold_keys(&path, true), "already unfolded");
+        assert_eq!(rendered(&doc), before);
+        assert_eq!(doc.keys().hidden(), 0);
     }
 }

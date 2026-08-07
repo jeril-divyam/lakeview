@@ -12,7 +12,7 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use super::{format_ts, human_size, justify, truncate};
-use crate::app::{App, Focus, Load, Mode, PreviewBody, ReposRow, ReposView, RowKind, TreeView};
+use crate::app::{App, Focus, Load, PreviewBody, ReposRow, ReposView, RowKind, TreeView};
 use crate::jsonl::{DocRow, Row as JsonRow};
 use crate::theme::Theme;
 
@@ -31,7 +31,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     app.hits.preview_rows.clear();
     app.hits.commits = None;
 
-    if app.mode == Mode::Zoom {
+    // The key menu is a panel over the zoom rather than a place of its own, so
+    // the zoom is still what is drawn under it.
+    if app.zoomed() {
         app.hits.preview = Some(draw_detail(frame, app, area, true));
         return;
     }
@@ -374,6 +376,18 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, zoomed: bool) -> Re
     let mut right = Vec::new();
     if app.jsonl().is_some_and(|doc| doc.truncated) {
         right.push(Span::styled(" truncated ", Theme::faint()));
+    }
+    // What the key filter is holding back, for as long as it holds it back — a
+    // key that is simply absent from every record looks the same otherwise.
+    if let Some(hidden) = app
+        .jsonl()
+        .map(|doc| doc.keys().hidden())
+        .filter(|n| *n > 0)
+    {
+        right.push(Span::styled(
+            format!(" {hidden} key{} hidden ", if hidden == 1 { "" } else { "s" }),
+            Theme::accent(),
+        ));
     }
     if zoomed {
         right.push(Span::styled(" zoom ", Theme::chip()));
@@ -920,6 +934,9 @@ fn kv(key: &str, value: &str, style: Style) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The browser draws from `App::zoomed`, so only the tests, which drive the
+    // modes directly, still name them.
+    use crate::app::Mode;
     use crate::jsonl::Folding;
 
     /// Flatten a rendered line back to plain text, for comparison.
@@ -1327,5 +1344,163 @@ mod tests {
         // Every screen line of the pane maps back to a row, for the mouse.
         assert!(!app.hits.preview_rows.is_empty());
         assert!(app.hits.preview_rows.iter().all(|r| *r < 6));
+    }
+
+    // ── the key-filter menu ──────────────────────────────────────────────
+
+    /// The whole frame: the menu is drawn over the body by `ui::draw`, so the
+    /// browser's own `draw` never sees it.
+    fn framed(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn screen(buffer: &ratatui::buffer::Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A zoomed JSONL preview whose two records share a shape.
+    fn zoomed_jsonl(app: &mut App) {
+        let doc = crate::jsonl::parse("{\"a\":1,\"b\":2}\n{\"a\":3,\"b\":4}\n", false);
+        app.preview.body = Some(PreviewBody::Jsonl(doc));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+    }
+
+    #[tokio::test]
+    async fn the_key_menu_switches_a_key_off_behind_itself() {
+        let mut app = test_app();
+        zoomed_jsonl(&mut app);
+
+        app.open_keys();
+        assert_eq!(app.mode, Mode::Keys);
+        let buffer = framed(&mut app, 60, 20);
+        let all = screen(&buffer);
+        assert!(all.contains("Filter keys"), "{all}");
+        assert!(all.contains("[x] a") && all.contains("[x] b"), "{all}");
+        // The zoom is still what is drawn behind the panel.
+        assert!(all.contains(r#"▸ {"a": 1, "b": 2}"#), "{all}");
+
+        // The selected key wears the selection bar right across the panel — the
+        // menu's side margins are part of its lines for exactly this reason.
+        let list = app.keys.list;
+        let lit: Vec<u16> = (list.y..list.y + list.height)
+            .filter(|y| buffer[(list.x, *y)].bg == Theme::SURFACE)
+            .collect();
+        assert_eq!(lit, vec![list.y], "one row is selected: {all}");
+        assert_eq!(buffer[(list.right() - 1, list.y)].bg, Theme::SURFACE);
+
+        // Switch "b" off: the switch flips, and so do the records around it.
+        app.keys_move(1);
+        app.keys_toggle();
+        let all = screen(&framed(&mut app, 60, 20));
+        assert!(all.contains("[ ] b"), "{all}");
+        assert!(all.contains(r#"▸ {"a": 1}"#), "{all}");
+        // And the pane says what it is holding back, since a key that is simply
+        // absent would look exactly the same.
+        assert!(all.contains("1 key hidden"), "{all}");
+
+        // Esc puts the filter back as it was.
+        app.close_keys(false);
+        assert_eq!(
+            app.mode,
+            Mode::Zoom,
+            "the menu closes to the zoom, not to the tree"
+        );
+        let all = screen(&framed(&mut app, 60, 20));
+        assert!(all.contains(r#"▸ {"a": 1, "b": 2}"#), "{all}");
+        assert!(!all.contains("key hidden"), "{all}");
+    }
+
+    #[tokio::test]
+    async fn a_click_on_a_menu_line_switches_that_key() {
+        let mut app = test_app();
+        zoomed_jsonl(&mut app);
+        app.open_keys();
+        framed(&mut app, 60, 20);
+
+        // The second line of the list, as the draw above placed it.
+        let list = app.keys.list;
+        assert_eq!(app.keys_row_at(list.x, list.y + 1), Some(1));
+        app.keys_select(1);
+        app.keys_toggle();
+        assert_eq!(app.jsonl().unwrap().keys().hidden(), 1);
+
+        // A click away from the panel is done with it, and keeps the edits.
+        assert!(!app.in_keys_popup(0, 0));
+        app.close_keys(true);
+        assert_eq!(app.jsonl().unwrap().keys().hidden(), 1);
+    }
+
+    /// The menu has to fit itself into whatever room the zoom has, and say when
+    /// there are more keys than it can show at once.
+    #[tokio::test]
+    async fn the_menu_fits_itself_into_a_small_terminal() {
+        let mut app = test_app();
+        let wide: String = (0..12)
+            .map(|i| format!(r#""key_number_{i}":{i}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(
+            &format!("{{{wide}}}\n"),
+            false,
+        )));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+        app.open_keys();
+        app.keys_move(9);
+
+        let all = screen(&framed(&mut app, 46, 14));
+        // The selected key is on screen, and the count says what is not.
+        assert!(all.contains("[x] key_number_9"), "{all}");
+        assert!(all.contains("10/12"), "{all}");
+        assert!(
+            app.keys.popup.width <= 46 && app.keys.popup.height <= 14,
+            "{all}"
+        );
+
+        // Back to the top, and the menu scrolls with it.
+        app.keys_move(isize::MIN / 2);
+        let all = screen(&framed(&mut app, 46, 14));
+        assert!(all.contains("[x] key_number_0"), "{all}");
+        assert!(all.contains("1/12"), "{all}");
+    }
+
+    /// `F` where there are no record keys has nothing to offer, and says so
+    /// rather than opening an empty panel.
+    #[tokio::test]
+    async fn the_menu_only_opens_over_records_with_keys() {
+        let mut app = test_app();
+        app.open_keys();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.status.as_ref().is_some_and(|s| s.is_error));
+
+        // Zoomed, but on a whole JSON file rather than records.
+        let value: serde_json::Value = serde_json::from_str(r#"{"a":1}"#).unwrap();
+        app.preview.body = Some(PreviewBody::Json {
+            lines: Vec::new(),
+            doc: crate::jsonl::JsonDoc::new(value),
+        });
+        app.mode = Mode::Zoom;
+        app.open_keys();
+        assert_eq!(app.mode, Mode::Zoom);
+
+        // Records without object keys have nothing to switch off either.
+        app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse("1\n2\n", false)));
+        app.open_keys();
+        assert_eq!(app.mode, Mode::Zoom);
     }
 }

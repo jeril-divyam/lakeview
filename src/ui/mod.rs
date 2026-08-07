@@ -45,6 +45,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Mode::Profiles(selected) = app.mode {
         overlay::profiles(frame, app, selected, area);
     }
+    // Inside the zoom's own frame rather than over the whole screen: the menu
+    // belongs to the file it filters, and it clears a band around itself, which
+    // must not take the pane's borders or its title with it.
+    if app.mode == Mode::Keys {
+        let area = app.hits.preview.unwrap_or(body);
+        overlay::keys(frame, app, area);
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -183,8 +190,26 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let hints: &[(&str, &str)] = match (app.tab, &app.mode) {
         (_, Mode::Filter) => &[("type", "filter"), ("Enter", "apply"), ("Esc", "clear")],
         (_, Mode::Profiles(_)) => &[("↑↓/jk", "move"), ("Enter", "switch"), ("Esc", "cancel")],
-        // A zoomed JSON or JSONL file has rows to fold; anything else zoomed is
-        // a flat body, where the same keys only move the view.
+        (_, Mode::Keys) => &[
+            ("↑↓/jk", "move"),
+            ("space", "on/off"),
+            ("←→", "fold"),
+            ("a/n", "all/none"),
+            ("Enter", "apply"),
+            ("Esc", "cancel"),
+        ],
+        // Only a JSONL file is a shape repeated often enough for its keys to be
+        // worth switching off, so only it offers the menu.
+        (_, Mode::Zoom) if app.jsonl().is_some() => &[
+            ("↑↓/jk", "move"),
+            ("→/space", "unfold"),
+            ("←/h", "fold"),
+            ("F", "filter"),
+            ("Esc", "leave"),
+            ("d", "download"),
+        ],
+        // A zoomed JSON file has rows to fold; anything else zoomed is a flat
+        // body, where the same keys only move the view.
         (_, Mode::Zoom) if app.zoom_doc().is_some() => &[
             ("↑↓/jk", "move"),
             ("→/space", "unfold"),

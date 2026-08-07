@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod jsonl;
+mod keys;
 mod lakefs;
 mod theme;
 mod ui;
@@ -196,19 +197,41 @@ fn on_key(app: &mut App, key: KeyEvent) {
     match app.mode.clone() {
         Mode::Filter => on_key_filter(app, key),
         Mode::Profiles(selected) => on_key_profiles(app, key, selected),
+        Mode::Keys => on_key_keys(app, key),
         Mode::Normal | Mode::Zoom => on_key_normal(app, key, ctrl),
     }
 }
 
 fn on_mouse(app: &mut App, mouse: MouseEvent) {
     let (col, row) = (mouse.column, mouse.row);
+
+    // The key menu takes the pointer while it is up: clicking a key switches it,
+    // and clicking away from the menu closes it, keeping the edits.
+    if app.mode == Mode::Keys {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => match app.keys_row_at(col, row) {
+                Some(line) => {
+                    app.keys_select(line);
+                    app.keys_toggle();
+                }
+                // Its border is still the menu; anywhere else means done.
+                None if !app.in_keys_popup(col, row) => app.close_keys(true),
+                None => {}
+            },
+            MouseEventKind::ScrollDown => app.keys_scroll(true),
+            MouseEventKind::ScrollUp => app.keys_scroll(false),
+            _ => {}
+        }
+        return;
+    }
+
     match mouse.kind {
         MouseEventKind::ScrollDown => app.mouse_scroll(col, row, true),
         MouseEventKind::ScrollUp => app.mouse_scroll(col, row, false),
         // Overlays are keyboard-driven; a click elsewhere just dismisses them.
         MouseEventKind::Down(MouseButton::Left) => match app.mode {
             Mode::Profiles(_) | Mode::Filter => app.mode = Mode::Normal,
-            Mode::Zoom | Mode::Normal => app.mouse_click(col, row),
+            Mode::Keys | Mode::Zoom | Mode::Normal => app.mouse_click(col, row),
         },
         MouseEventKind::Down(MouseButton::Right) => app.mouse_back(),
         _ => {}
@@ -249,6 +272,27 @@ fn on_key_profiles(app: &mut App, key: KeyEvent, selected: usize) {
                 }
             }
         }
+        _ => {}
+    }
+}
+
+/// The key-filter menu. Its own keys, since every one of them means something
+/// else in the view behind it.
+fn on_key_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.close_keys(false),
+        KeyCode::Enter | KeyCode::Char('F') => app.close_keys(true),
+        KeyCode::Char(' ') | KeyCode::Char('x') => app.keys_toggle(),
+        KeyCode::Char('j') | KeyCode::Down => app.keys_move(1),
+        KeyCode::Char('k') | KeyCode::Up => app.keys_move(-1),
+        KeyCode::Char('l') | KeyCode::Right => app.keys_fold(true),
+        KeyCode::Char('h') | KeyCode::Left => app.keys_fold(false),
+        KeyCode::Char('a') => app.keys_set_all(true),
+        KeyCode::Char('n') => app.keys_set_all(false),
+        KeyCode::Char('g') | KeyCode::Home => app.keys_move(isize::MIN / 2),
+        KeyCode::Char('G') | KeyCode::End => app.keys_move(isize::MAX / 2),
+        KeyCode::PageDown => app.keys_move(app.keys.viewport as isize),
+        KeyCode::PageUp => app.keys_move(-(app.keys.viewport as isize)),
         _ => {}
     }
 }
@@ -304,6 +348,13 @@ fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
         KeyCode::Char('d') => {
             if app.tab == Tab::Browse {
                 app.download_selected();
+            }
+        }
+        // Only a zoomed `.jsonl` has keys to filter; `open_keys` says so when
+        // that is not what is on screen.
+        KeyCode::Char('F') => {
+            if app.tab == Tab::Browse {
+                app.open_keys();
             }
         }
         KeyCode::Char('p') => {

@@ -21,6 +21,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::{Config, Profile};
 use crate::jsonl::Folding;
+use crate::keys::{KeyFilter, MenuRow};
 use crate::lakefs::{Client, Commit, NamedRef, ObjectStats, RefKind, Repository};
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -603,12 +604,38 @@ pub enum Mode {
     Zoom,
     /// Profile picker overlay.
     Profiles(usize),
+    /// The key-filter menu, floating over a zoomed JSONL preview. The zoom is
+    /// still what is drawn behind it — see [`App::zoomed`].
+    Keys,
 }
 
 pub struct Status {
     pub text: String,
     pub is_error: bool,
     pub at: Instant,
+}
+
+// ── the key-filter menu ──────────────────────────────────────────────────
+
+/// Everything the key menu needs that isn't the filter itself. The filter lives
+/// on the document it filters, so it lasts exactly as long as the preview does;
+/// this is the overlay's own cursor, and the copy `Esc` puts back.
+#[derive(Default)]
+pub struct KeysMenu {
+    pub cursor: usize,
+    pub scroll: usize,
+    /// Height of the menu's list area, refreshed on each draw.
+    pub viewport: usize,
+    /// The filter as it was when the menu opened. Edits show through the menu
+    /// as they are made — the file is right there behind it — so cancelling
+    /// means putting this back rather than never having applied anything.
+    undo: Option<KeyFilter>,
+    /// Whether anything was actually switched, so closing an untouched menu
+    /// leaves the document alone.
+    edited: bool,
+    /// Rects of the last draw: the whole popup, and the list inside it.
+    pub popup: Rect,
+    pub list: Rect,
 }
 
 // ── mouse hit-testing ────────────────────────────────────────────────────
@@ -659,6 +686,7 @@ pub struct App {
     pub mode: Mode,
     pub commits: CommitsView,
     pub preview: Preview,
+    pub keys: KeysMenu,
     pub status: Option<Status>,
     pub should_quit: bool,
 
@@ -705,6 +733,7 @@ impl App {
             mode: Mode::Normal,
             commits: CommitsView::default(),
             preview: Preview::default(),
+            keys: KeysMenu::default(),
             status: None,
             should_quit: false,
             next_req: 0,
@@ -751,11 +780,26 @@ impl App {
             .map(|(repo, reference)| (repo.as_str(), reference.as_str()))
     }
 
-    /// The zoomed JSONL document, when that is what is on screen. Only the
-    /// `truncated` mark is particular to it; folding goes through `zoom_doc`.
+    /// Whether the preview has the screen to itself. The key menu is a panel
+    /// over the zoom rather than a place of its own, so the zoom is still what
+    /// is drawn, moved and folded underneath it.
+    pub fn zoomed(&self) -> bool {
+        matches!(self.mode, Mode::Zoom | Mode::Keys)
+    }
+
+    /// The zoomed JSONL document, when that is what is on screen. The
+    /// `truncated` mark and the key filter are particular to it; folding goes
+    /// through `zoom_doc`.
     pub fn jsonl(&self) -> Option<&crate::jsonl::Doc> {
-        match (&self.mode, &self.preview.body) {
-            (Mode::Zoom, Some(PreviewBody::Jsonl(doc))) => Some(doc),
+        match (self.zoomed(), &self.preview.body) {
+            (true, Some(PreviewBody::Jsonl(doc))) => Some(doc),
+            _ => None,
+        }
+    }
+
+    fn jsonl_mut(&mut self) -> Option<&mut crate::jsonl::Doc> {
+        match (self.zoomed(), &mut self.preview.body) {
+            (true, Some(PreviewBody::Jsonl(doc))) => Some(doc),
             _ => None,
         }
     }
@@ -766,17 +810,17 @@ impl App {
     /// folded row in — a JSON file gets its flat pretty-print there, and JSONL
     /// the plain lines it is.
     pub fn zoom_doc(&self) -> Option<&dyn Folding> {
-        match (&self.mode, &self.preview.body) {
-            (Mode::Zoom, Some(PreviewBody::Jsonl(doc))) => Some(doc),
-            (Mode::Zoom, Some(PreviewBody::Json { doc, .. })) => Some(doc),
+        match (self.zoomed(), &self.preview.body) {
+            (true, Some(PreviewBody::Jsonl(doc))) => Some(doc),
+            (true, Some(PreviewBody::Json { doc, .. })) => Some(doc),
             _ => None,
         }
     }
 
     fn zoom_doc_mut(&mut self) -> Option<&mut dyn Folding> {
-        match (&self.mode, &mut self.preview.body) {
-            (Mode::Zoom, Some(PreviewBody::Jsonl(doc))) => Some(doc),
-            (Mode::Zoom, Some(PreviewBody::Json { doc, .. })) => Some(doc),
+        match (self.zoomed(), &mut self.preview.body) {
+            (true, Some(PreviewBody::Jsonl(doc))) => Some(doc),
+            (true, Some(PreviewBody::Json { doc, .. })) => Some(doc),
             _ => None,
         }
     }
@@ -1538,7 +1582,7 @@ impl App {
             }
             // A zoomed JSONL preview has rows to move between; anything else
             // zoomed is a flat body, and moves the view itself.
-            _ if self.mode == Mode::Zoom => match self.zoom_doc_mut() {
+            _ if self.zoomed() => match self.zoom_doc_mut() {
                 Some(doc) => doc.move_cursor(delta),
                 None => {
                     self.preview.scroll = self
@@ -1564,7 +1608,7 @@ impl App {
     }
 
     pub fn select_edge(&mut self, first: bool) {
-        if self.mode == Mode::Zoom {
+        if self.zoomed() {
             match self.zoom_doc_mut() {
                 Some(doc) => doc.select_edge(first),
                 // The render clamps this to the body's real height, which is
@@ -1624,7 +1668,7 @@ impl App {
     pub fn open(&mut self) {
         // Already zoomed: descending means unfolding the selected record, and
         // there is nothing else left to open.
-        if self.mode == Mode::Zoom {
+        if self.zoomed() {
             if let Some(doc) = self.zoom_doc_mut() {
                 doc.toggle_cursor();
             }
@@ -1674,7 +1718,7 @@ impl App {
 
     /// `←` — ascend: collapse, step to the parent, or move focus left.
     pub fn back(&mut self) {
-        if self.mode == Mode::Zoom {
+        if self.zoomed() {
             // A zoomed JSONL folds its way out a level at a time; the zoom is
             // only what `←` leaves once nothing is left open.
             if let Some(doc) = self.zoom_doc_mut()
@@ -1723,7 +1767,7 @@ impl App {
 
     /// `space` — expand or collapse in place, without moving focus.
     pub fn toggle(&mut self) {
-        if self.mode == Mode::Zoom {
+        if self.zoomed() {
             if let Some(doc) = self.zoom_doc_mut() {
                 doc.toggle_cursor();
             }
@@ -1810,13 +1854,182 @@ impl App {
         });
     }
 
+    // ── the key filter ───────────────────────────────────────────────────
+
+    /// `F` — open the menu of keys the zoomed records use.
+    ///
+    /// Only JSONL has one. A whole JSON file is a single value rather than a
+    /// shape repeated, so there is no set of keys that switching off would say
+    /// anything about.
+    pub fn open_keys(&mut self) {
+        let Some(doc) = self.jsonl() else {
+            self.set_status("F filters the keys of a zoomed .jsonl file", true);
+            return;
+        };
+        if doc.keys().is_empty() {
+            self.set_status("nothing to filter: these records have no object keys", true);
+            return;
+        }
+        self.keys.undo = Some(doc.keys().clone());
+        self.keys.edited = false;
+        self.mode = Mode::Keys;
+        self.status = None;
+        self.clamp_keys_cursor();
+    }
+
+    /// Close the menu, keeping the edits or putting the old filter back.
+    pub fn close_keys(&mut self, keep: bool) {
+        // Back to the zoom the menu was opened over, not to the tree.
+        self.mode = Mode::Zoom;
+        let undo = self.keys.undo.take();
+        let edited = std::mem::take(&mut self.keys.edited);
+        if let (false, true, Some(old)) = (keep, edited, undo)
+            && let Some(doc) = self.jsonl_mut()
+        {
+            doc.edit_keys(|filter| *filter = old);
+        }
+    }
+
+    pub fn keys_rows(&self) -> Vec<MenuRow> {
+        self.jsonl()
+            .map(|doc| doc.keys().rows())
+            .unwrap_or_default()
+    }
+
+    /// The tree node the menu selection is on.
+    fn keys_path(&self) -> Option<Vec<usize>> {
+        self.keys_rows()
+            .into_iter()
+            .nth(self.keys.cursor)
+            .map(|row| row.path)
+    }
+
+    pub fn keys_move(&mut self, delta: isize) {
+        let last = self.keys_rows().len() as isize - 1;
+        if last < 0 {
+            return;
+        }
+        self.keys.cursor = (self.keys.cursor as isize)
+            .saturating_add(delta)
+            .clamp(0, last) as usize;
+        self.focus_keys_cursor();
+    }
+
+    /// Switch the selected key on or off.
+    pub fn keys_toggle(&mut self) {
+        let Some(path) = self.keys_path() else {
+            return;
+        };
+        if let Some(doc) = self.jsonl_mut() {
+            doc.edit_keys(|filter| filter.toggle(&path));
+        }
+        self.keys.edited = true;
+    }
+
+    /// Unfold or fold the selected key. Folding one that is already folded steps
+    /// out to its parent, so `←` walks back up the tree the way it does
+    /// everywhere else.
+    pub fn keys_fold(&mut self, open: bool) {
+        let Some(path) = self.keys_path() else {
+            return;
+        };
+        let moved = self
+            .jsonl_mut()
+            .is_some_and(|doc| doc.fold_keys(&path, open));
+        if moved {
+            self.clamp_keys_cursor();
+            return;
+        }
+        if !open && path.len() > 1 {
+            let parent = &path[..path.len() - 1];
+            if let Some(row) = self.keys_rows().iter().position(|r| r.path == parent) {
+                self.keys.cursor = row;
+                self.focus_keys_cursor();
+            }
+        }
+    }
+
+    pub fn keys_set_all(&mut self, enabled: bool) {
+        if let Some(doc) = self.jsonl_mut() {
+            doc.edit_keys(|filter| filter.set_all(enabled));
+        }
+        self.keys.edited = true;
+    }
+
+    /// Select a menu line, as a click does.
+    pub fn keys_select(&mut self, row: usize) {
+        if row < self.keys_rows().len() {
+            self.keys.cursor = row;
+            self.focus_keys_cursor();
+        }
+    }
+
+    /// The wheel scrolls the menu, dragging the selection along by its edge so
+    /// it can't be left off screen.
+    pub fn keys_scroll(&mut self, down: bool) {
+        let rows = self.keys_rows().len();
+        let max = rows.saturating_sub(self.keys.viewport.max(1));
+        self.keys.scroll = if down {
+            (self.keys.scroll + WHEEL_LINES).min(max)
+        } else {
+            self.keys.scroll.saturating_sub(WHEEL_LINES)
+        };
+        let bottom = self.keys.scroll + self.keys.viewport.max(1) - 1;
+        self.keys.cursor = self
+            .keys
+            .cursor
+            .clamp(self.keys.scroll.min(bottom), bottom)
+            .min(rows.saturating_sub(1));
+    }
+
+    /// Note how tall the menu came out, keeping the selection in view.
+    pub fn keys_resize(&mut self, viewport: usize) {
+        self.keys.viewport = viewport.max(1);
+        self.focus_keys_cursor();
+    }
+
+    /// Whether a click landed on the menu at all, its border included.
+    pub fn in_keys_popup(&self, col: u16, row: u16) -> bool {
+        Hits::hit(self.keys.popup, col, row)
+    }
+
+    /// Map a click to a menu line.
+    pub fn keys_row_at(&self, col: u16, row: u16) -> Option<usize> {
+        if !Hits::hit(self.keys.list, col, row) {
+            return None;
+        }
+        let line = self.keys.scroll + (row - self.keys.list.y) as usize;
+        (line < self.keys_rows().len()).then_some(line)
+    }
+
+    fn clamp_keys_cursor(&mut self) {
+        let last = self.keys_rows().len().saturating_sub(1);
+        self.keys.cursor = self.keys.cursor.min(last);
+        self.focus_keys_cursor();
+    }
+
+    fn focus_keys_cursor(&mut self) {
+        let viewport = self.keys.viewport.max(1);
+        if self.keys.cursor < self.keys.scroll {
+            self.keys.scroll = self.keys.cursor;
+        } else if self.keys.cursor >= self.keys.scroll + viewport {
+            self.keys.scroll = self.keys.cursor + 1 - viewport;
+        }
+        // Never leave blank rows under the last key. The menu is sized to its
+        // own content on each draw, so a scroll that was needed a moment ago —
+        // before the first draw said how tall the list is, or before unfolding
+        // gave it more room — is usually not needed now.
+        let max = self.keys_rows().len().saturating_sub(viewport);
+        self.keys.scroll = self.keys.scroll.min(max);
+    }
+
     // ── tabs ─────────────────────────────────────────────────────────────
 
     pub fn select_tab(&mut self, tab: Tab) {
         self.tab = tab;
         // Zoom is a Browse-tab thing; leaving the tab leaves the zoom, but
         // asking for the tab you are already on changes nothing.
-        if self.mode == Mode::Zoom && tab != Tab::Browse {
+        if self.zoomed() && tab != Tab::Browse {
             self.mode = Mode::Normal;
         }
         if tab == Tab::Commits {
@@ -1868,7 +2081,7 @@ impl App {
         }
 
         // Zoomed preview, or the preview pane in the normal layout.
-        if self.mode == Mode::Zoom || self.hits.preview.is_some_and(|a| Hits::hit(a, col, row)) {
+        if self.zoomed() || self.hits.preview.is_some_and(|a| Hits::hit(a, col, row)) {
             // A zoomed JSONL preview is the focused list, so the wheel moves its
             // selection the way it does in any other focused pane.
             if self.zoom_doc().is_some() {

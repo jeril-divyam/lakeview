@@ -53,6 +53,11 @@ impl Theme {
         Style::new().fg(Self::RED)
     }
 
+    /// A switch that is on, in the key-filter menu.
+    pub fn ok() -> Style {
+        Style::new().fg(Self::GREEN)
+    }
+
     pub fn border(focused: bool) -> Style {
         Style::new().fg(if focused {
             Self::BORDER_FOCUS
