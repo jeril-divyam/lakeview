@@ -218,11 +218,13 @@ rest, and re-flowing one record over ten lines would bury the records under it.
 Everything else wraps, so the long values an unfolded record exposes are
 readable at full width.
 
-The side pane leaves `.jsonl` alone and shows it as the plain lines it is: at
-that width there is no room to fold anything usefully. A record that isn't valid
-JSON stays visible in red with the parse error beside it, and unfolds to show
-the message and the raw text. Records lost to the `preview_bytes` cap are marked
-`truncated` in the pane's title rather than shown half-read.
+The side pane doesn't fold — at that width there is no room to usefully — but it
+gives each record a line, syntax-coloured like the JSON preview beside it. The
+records are re-spaced to be coloured at all, so what it shows is the JSON each
+line holds rather than its exact bytes; the zoom is the same. A record that isn't
+valid JSON keeps its raw text, in red with the parse error beside it, and unfolds
+to show the message and the text. Records lost to the `preview_bytes` cap are
+marked `truncated` in the pane's title rather than shown half-read.
 
 ## Mouse
 

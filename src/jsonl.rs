@@ -544,6 +544,24 @@ impl Entry {
         cells
     }
 
+    /// The record as the side pane shows it: one coloured line, whatever the
+    /// zoom has folded or unfolded — the two views share a document, not a
+    /// cursor, and the pane has no fold state of its own to show.
+    ///
+    /// The text is re-spaced by `compact` rather than kept verbatim, which is
+    /// what lets it be coloured at all, and matches the whole-file JSON preview
+    /// beside it. A record that doesn't parse keeps its raw text and its error.
+    pub fn line(&self) -> Cells {
+        match (&self.value, &self.error) {
+            (_, Some(err)) => vec![
+                (JsonTok::Error, self.raw.clone()),
+                (JsonTok::Null, format!("   ({err})")),
+            ],
+            (Some(value), _) => compact(value, PREVIEW_BUDGET),
+            (None, None) => Vec::new(),
+        }
+    }
+
     fn body(&self) -> Vec<Row> {
         if let Some(err) = &self.error {
             return vec![
@@ -814,6 +832,37 @@ mod tests {
         doc.toggle_row(0);
         assert_eq!(doc.rows_len(), 1);
         assert_eq!(doc.cursor, 0);
+    }
+
+    /// What the side pane draws: coloured, on one line, and the same whether or
+    /// not the zoom has the record open.
+    #[test]
+    fn the_side_pane_line_is_coloured_and_ignores_the_fold_state() {
+        let mut doc = doc(&[r#"{"a":1,"b":"x"}"#]);
+        let flat = |d: &Doc| -> String {
+            d.entries[0].line().iter().map(|(_, s)| s.clone()).collect()
+        };
+        assert_eq!(flat(&doc), r#"{"a": 1, "b": "x"}"#);
+
+        let cells = doc.entries[0].line();
+        let toks: Vec<JsonTok> = cells.iter().map(|(t, _)| *t).collect();
+        assert!(toks.contains(&JsonTok::Key), "{toks:?}");
+        assert!(toks.contains(&JsonTok::Num), "{toks:?}");
+        assert!(toks.contains(&JsonTok::Str), "{toks:?}");
+        // No fold marker: the pane has nothing to fold.
+        assert!(!toks.contains(&JsonTok::Marker), "{toks:?}");
+
+        // Unfolding it in the zoom leaves the pane's line alone.
+        doc.toggle_row(0);
+        assert_eq!(flat(&doc), r#"{"a": 1, "b": "x"}"#);
+    }
+
+    #[test]
+    fn an_invalid_record_keeps_its_raw_text_in_the_side_pane() {
+        let doc = doc(&["not json"]);
+        let cells = doc.entries[0].line();
+        assert_eq!(cells[0].0, JsonTok::Error);
+        assert_eq!(cells[0].1, "not json");
     }
 
     #[test]

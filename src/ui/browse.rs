@@ -889,15 +889,20 @@ fn preview_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 ]));
             }
         }
-        // Records are only worth folding at full width, so the side pane shows
-        // them as the lines they are; `→` zooms to the one that unfolds them.
+        // Records are only worth folding at full width, so the side pane gives
+        // each one a line, coloured like the JSON preview beside it but never
+        // folded; `→` zooms to the view that unfolds them.
         Some(PreviewBody::Jsonl(doc)) => {
             let gutter = doc.entries.len().to_string().len().max(2);
             for (i, entry) in doc.entries.iter().enumerate() {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{:>gutter$} ", i + 1), Theme::faint()),
-                    Span::styled(entry.raw.clone(), Theme::file()),
-                ]));
+                let mut spans = vec![Span::styled(format!("{:>gutter$} ", i + 1), Theme::faint())];
+                spans.extend(
+                    entry
+                        .line()
+                        .iter()
+                        .map(|(tok, text)| Span::styled(text.clone(), Theme::json(*tok))),
+                );
+                lines.push(Line::from(spans));
             }
         }
     }
@@ -1204,6 +1209,29 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// The side pane's JSONL records carry the same syntax colours the JSON
+    /// preview beside them does, rather than one flat run of text.
+    #[tokio::test]
+    async fn the_side_pane_colours_jsonl_records() {
+        use crate::app::JsonTok;
+
+        let mut app = test_app();
+        app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(
+            "{\"a\":1,\"b\":\"x\"}\n",
+            false,
+        )));
+
+        let lines = preview_lines(&app, 40);
+        let record = lines.last().expect("the record's line");
+        let styles: Vec<Style> = record.spans.iter().map(|s| s.style).collect();
+
+        assert!(styles.contains(&Theme::json(JsonTok::Key)), "{styles:?}");
+        assert!(styles.contains(&Theme::json(JsonTok::Num)), "{styles:?}");
+        assert!(styles.contains(&Theme::json(JsonTok::Str)), "{styles:?}");
+        // The gutter keeps its own faint style, ahead of the record's cells.
+        assert_eq!(record.spans[0].style, Theme::faint());
     }
 
     /// A JSON file zoomed: the whole draw path, over the shape the zoom opens
