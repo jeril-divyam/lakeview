@@ -29,28 +29,22 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // The repository pane takes its fixed width; the tree and the preview
+    // split what is left evenly. On a narrow terminal panes drop out rather
+    // than being crushed — the preview goes first, then the repository list,
+    // leaving the focused pane the whole width.
     let repos_w = app.cfg.ui.repos_width.clamp(14, 40);
-    // On a narrow terminal the panes drop out rather than being crushed: the
-    // preview goes first, then the repository list, leaving the focused pane.
     let show_repos = area.width >= repos_w + MIN_TREE;
-    let mut preview_w = if app.cfg.ui.preview_percent == 0 {
-        0
-    } else {
-        (area.width as u32 * app.cfg.ui.preview_percent.min(70) as u32 / 100) as u16
-    };
-    let taken = if show_repos { repos_w } else { 0 } + MIN_TREE;
-    if area.width < taken + 20 {
-        preview_w = 0;
-    }
-    preview_w = preview_w.min(area.width.saturating_sub(taken));
+    let remainder = area.width.saturating_sub(if show_repos { repos_w } else { 0 });
+    let show_preview = app.cfg.ui.preview_percent > 0 && remainder >= 2 * MIN_TREE;
 
     let mut constraints = Vec::with_capacity(3);
     if show_repos {
         constraints.push(Constraint::Length(repos_w));
     }
-    constraints.push(Constraint::Min(MIN_TREE));
-    if preview_w > 0 {
-        constraints.push(Constraint::Length(preview_w));
+    constraints.push(Constraint::Fill(1));
+    if show_preview {
+        constraints.push(Constraint::Fill(1));
     }
     let chunks = Layout::horizontal(constraints).split(area);
 
@@ -77,7 +71,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         app.tick,
     ));
 
-    if preview_w > 0 {
+    if show_preview {
         app.hits.preview = Some(draw_detail(frame, app, chunks[next], false));
     }
 }

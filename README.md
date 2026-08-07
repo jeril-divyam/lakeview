@@ -3,8 +3,9 @@
 A terminal browser for [lakeFS](https://lakefs.io), written in Rust with
 [ratatui](https://ratatui.rs).
 
-Three panes: repositories on the left, a tree of one ref's objects in the
-middle, and a live detail/preview pane pinned to the right edge.
+Three panes: repositories on the left at a fixed width, then a tree of one
+ref's objects and a live detail/preview pane sharing the rest of the width
+evenly.
 
 ```
 ╭────────────────────────────────────────────────────────────────────────────────╮
@@ -52,7 +53,7 @@ default_profile = "local"
 
 [ui]
 repos_width = 28        # width of the repositories pane
-preview_percent = 38    # share of the screen given to the preview pane (0 disables)
+preview_percent = 38    # set to 0 to hide the preview pane
 preview_bytes = 65536   # max bytes fetched when previewing a file
 page_size = 500         # entries fetched per API request
 search_max_requests = 300  # listings a recursive `/` search may spend

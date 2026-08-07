@@ -8,7 +8,7 @@ default_profile = "local"
 
 [ui]
 repos_width = 28        # width of the repositories pane
-preview_percent = 38    # share of the screen given to the preview pane (0 disables)
+preview_percent = 38    # set to 0 to hide the preview pane (it splits the rest with the tree)
 preview_bytes = 65536   # max bytes fetched when previewing a file
 page_size = 500         # entries fetched per API request (lakeFS caps at 1000)
 search_max_requests = 300  # listings a recursive `/` search may spend

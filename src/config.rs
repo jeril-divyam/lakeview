@@ -54,7 +54,9 @@ pub struct UiConfig {
     /// so configs written for the old Miller-column layout still load.
     #[serde(default = "default_repos_width", alias = "column_width")]
     pub repos_width: u16,
-    /// Percentage of the screen given to the preview pane (0 disables it).
+    /// Whether the preview pane is shown; `0` hides it. The tree and the
+    /// preview always split the width left over by the repository pane
+    /// evenly, so this no longer sets a width.
     #[serde(default = "default_preview_pct")]
     pub preview_percent: u16,
     /// Maximum number of bytes fetched when previewing an object.
@@ -199,7 +201,7 @@ default_profile = "local"
 
 [ui]
 repos_width = 28        # width of the repositories pane
-preview_percent = 38    # share of the screen given to the preview pane
+preview_percent = 38    # set to 0 to hide the preview pane
 preview_bytes = 65536   # max bytes fetched when previewing a file
 page_size = 500         # entries fetched per API request
 search_max_requests = 300  # listings a recursive `/` search may spend
