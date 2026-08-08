@@ -653,6 +653,10 @@ pub struct Hits {
     /// For a zoomed JSONL preview, the row each screen line of that area shows.
     /// A row that wrapped occupies several entries.
     pub preview_rows: Vec<usize>,
+    /// For the same preview, the line each row of the whole document starts at.
+    /// The layout is the only account of how tall a row came out, and paging
+    /// needs that for rows off screen as well as on it.
+    pub preview_row_starts: Vec<usize>,
     /// Inner area of the commit list.
     pub commits: Option<Rect>,
     /// (tab, label area) for each tab in the header.
@@ -1607,6 +1611,52 @@ impl App {
         }
     }
 
+    /// `Ctrl-f` / `Ctrl-b` — a screenful at a time through a zoomed foldable
+    /// document. Zoom-only: the panes have `Ctrl-d` and `Ctrl-u`, and a flat
+    /// body has no rows to page between.
+    ///
+    /// Where `Ctrl-d` moves the selection and leaves the view to chase it, this
+    /// moves the view and brings the selection along to the top of it. The row
+    /// straddling the edge is carried over whole rather than split between the
+    /// two pages, so a page always starts where a row does — which is the same
+    /// row of overlap you would get anywhere else.
+    pub fn page(&mut self, down: bool) {
+        let Some(last_row) = self.zoom_doc().map(|doc| doc.rows_len().saturating_sub(1)) else {
+            return;
+        };
+        // Without a frame to measure there is no page to speak of yet.
+        let starts = &self.hits.preview_row_starts;
+        let height = self.hits.preview.map_or(0, |a| a.height as usize);
+        if starts.is_empty() || height == 0 {
+            return;
+        }
+
+        let top = self.preview.scroll as usize;
+        let current = row_at_line(starts, top);
+        let edge = if down {
+            top + height - 1
+        } else {
+            top.saturating_sub(height - 1)
+        };
+        let mut row = row_at_line(starts, edge);
+        // A row taller than the pane straddles both edges at once, and the view
+        // is held to whole rows, so paging to it would land back where it
+        // started. Step over it instead of paging onto itself for ever.
+        if row == current {
+            row = if down {
+                current + 1
+            } else {
+                current.saturating_sub(1)
+            };
+        }
+        let row = row.min(last_row).min(starts.len() - 1);
+
+        self.preview.scroll = starts[row].min(u16::MAX as usize) as u16;
+        if let Some(doc) = self.zoom_doc_mut() {
+            doc.set_cursor(row);
+        }
+    }
+
     pub fn select_edge(&mut self, first: bool) {
         if self.zoomed() {
             match self.zoom_doc_mut() {
@@ -2325,6 +2375,13 @@ impl App {
     }
 }
 
+/// The row showing screen line `line`, given the line each row starts at. A line
+/// past the end of the body belongs to the last row, which is what the view
+/// would be showing there anyway.
+fn row_at_line(starts: &[usize], line: usize) -> usize {
+    starts.partition_point(|start| *start <= line).saturating_sub(1)
+}
+
 fn fmt_err(e: anyhow::Error) -> String {
     // Flatten the anyhow chain into one line, dropping duplicate context.
     let mut parts: Vec<String> = Vec::new();
@@ -2657,6 +2714,25 @@ mod tests {
             create_download_file(&dir, "LICENSE").await.unwrap().1,
             "LICENSE (1)"
         );
+    }
+
+    // ── paging the zoom ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_line_belongs_to_the_row_it_falls_inside() {
+        // Rows 0 and 2 took a line each; row 1 wrapped over three.
+        let starts = [0, 1, 4];
+        assert_eq!(row_at_line(&starts, 0), 0);
+        assert_eq!(row_at_line(&starts, 1), 1);
+        assert_eq!(row_at_line(&starts, 3), 1, "still inside the wrapped row");
+        assert_eq!(row_at_line(&starts, 4), 2);
+    }
+
+    #[test]
+    fn a_line_past_the_body_belongs_to_its_last_row() {
+        // Paging asks about the line under the bottom edge, which is off the end
+        // of a body shorter than the pane.
+        assert_eq!(row_at_line(&[0, 1, 4], 99), 2);
     }
 
     #[test]

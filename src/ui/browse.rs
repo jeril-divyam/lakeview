@@ -473,6 +473,7 @@ fn draw_zoom(frame: &mut Frame, app: &mut App, area: Rect) {
     let top = reveal(app.preview.scroll as usize, first, last, height, lines.len());
     app.preview.scroll = top.min(u16::MAX as usize) as u16;
 
+    app.hits.preview_row_starts = row_starts(&lines);
     let visible = lines.iter().skip(top).take(height);
     app.hits.preview_rows = visible.clone().map(|(row, _)| *row).collect();
     for (y, (_, line)) in visible.enumerate() {
@@ -543,6 +544,19 @@ fn zoom_layout(
         }
     }
     out
+}
+
+/// The screen line each row begins at. Rows are laid out in order, so the first
+/// line naming a row is the line it starts at, and one pass records them all.
+/// This is what paging measures a screenful against.
+fn row_starts(lines: &[(usize, Line<'static>)]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    for (line, (row, _)) in lines.iter().enumerate() {
+        if *row == starts.len() {
+            starts.push(line);
+        }
+    }
+    starts
 }
 
 /// Where the view should start so that the selected row — lines `first..last` —
@@ -1394,6 +1408,96 @@ mod tests {
         app.mode = Mode::Zoom;
         app.expand_all();
         assert!(app.status.is_none());
+    }
+
+    // ── paging ───────────────────────────────────────────────────────────
+
+    /// The pane's top line, as plain text.
+    fn top_row(buffer: &ratatui::buffer::Buffer, pane: Rect) -> String {
+        (pane.x..pane.x + pane.width)
+            .map(|x| buffer[(x, pane.y)].symbol())
+            .collect()
+    }
+
+    /// `Ctrl-f` / `Ctrl-b` move the view rather than the selection: each press
+    /// lands on the page after the one being read, and reads it from the top.
+    #[tokio::test]
+    async fn a_page_moves_the_view_a_screenful_at_a_time() {
+        let mut app = test_app();
+        let text: String = (0..40).map(|i| format!("{{\"n\":{i}}}\n")).collect();
+        app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(&text, false)));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+
+        let cursor = |app: &App| app.zoom_doc().expect("a foldable zoom").cursor();
+        let buffer = framed(&mut app, 60, 24);
+        let pane = app.hits.preview.expect("the zoom records its own area");
+        // Every record is folded onto a row of one line, so a page is the pane's
+        // own height, less the row carried over to the top of the next one.
+        let page = pane.height as usize - 1;
+        assert!(page > 2, "the pane should hold several records: {page}");
+        assert!(top_row(&buffer, pane).contains(r#"{"n": 0}"#));
+
+        app.page(true);
+        assert_eq!(cursor(&app), page);
+        // The view came with it: the page opens on the row it left off at.
+        assert_eq!(app.preview.scroll as usize, page);
+        let buffer = framed(&mut app, 60, 24);
+        let top = top_row(&buffer, pane);
+        assert!(top.contains(&format!(r#"{{"n": {page}}}"#)), "{top:?}");
+
+        app.page(true);
+        assert_eq!(cursor(&app), 2 * page);
+
+        // And back the way it came, a page at a time.
+        app.page(false);
+        assert_eq!(cursor(&app), page);
+        app.page(false);
+        assert_eq!(cursor(&app), 0);
+        assert_eq!(app.preview.scroll, 0);
+
+        // The end of the file stops it rather than the view running off it.
+        for _ in 0..20 {
+            app.page(true);
+        }
+        assert_eq!(cursor(&app), 39);
+        let buffer = framed(&mut app, 60, 24);
+        let all = screen(&buffer);
+        assert!(all.contains(r#"{"n": 39}"#), "{all}");
+    }
+
+    /// A row taller than the pane can only be read from its start, so paging
+    /// steps over it rather than landing back on it.
+    #[tokio::test]
+    async fn a_page_steps_over_a_row_taller_than_the_pane() {
+        let mut app = test_app();
+        let wide = format!(r#"{{"k":"{}"}}"#, "x".repeat(2000));
+        let mut doc = crate::jsonl::parse(&format!("{wide}\n{{\"n\":1}}\n"), false);
+        // Unfolded, the first record wraps well past the height of the pane.
+        doc.toggle_row(0);
+        app.preview.body = Some(PreviewBody::Jsonl(doc));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+
+        framed(&mut app, 60, 24);
+        let cursor = |app: &App| app.zoom_doc().expect("a foldable zoom").cursor();
+        assert_eq!(cursor(&app), 0);
+
+        app.page(true);
+        assert!(cursor(&app) > 0, "the page did not get past the long row");
+    }
+
+    /// Paging belongs to the foldable zoom. A flat body is scrolled rather than
+    /// selected through, and the panes have `Ctrl-d` and `Ctrl-u` of their own.
+    #[tokio::test]
+    async fn a_page_does_nothing_outside_a_foldable_zoom() {
+        let mut app = test_app();
+        app.preview.body = Some(PreviewBody::Text(vec!["plain".into(); 100]));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+
+        app.page(true);
+        assert_eq!(app.preview.scroll, 0);
     }
 
     // ── the key-filter menu ──────────────────────────────────────────────

@@ -312,6 +312,11 @@ fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
         KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
         KeyCode::Char('d') if ctrl => app.move_selection(10),
         KeyCode::Char('u') if ctrl => app.move_selection(-10),
+        // A whole screenful, in a zoomed `.json` or `.jsonl` and nowhere else.
+        // Kept out of the footer: the zoom already names more keys than it has
+        // room for, and these are the ones you reach for without being told.
+        KeyCode::Char('f') if ctrl => app.page(true),
+        KeyCode::Char('b') if ctrl => app.page(false),
         KeyCode::PageDown => app.move_selection(10),
         KeyCode::PageUp => app.move_selection(-10),
         KeyCode::Char('g') | KeyCode::Home => app.select_edge(true),
