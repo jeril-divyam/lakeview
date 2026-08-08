@@ -1855,8 +1855,9 @@ impl App {
         }
     }
 
-    /// `a` — unfold the whole zoomed document: all of it when the cursor is on
-    /// something folded, else to the level the cursor is reading at.
+    /// `a` — unfold the whole zoomed document: all of it when the cursor is on a
+    /// folded record, else to the level that record is reading at, from wherever
+    /// inside it the cursor sits.
     ///
     /// A level is otherwise invisible — a row folded at level 2 looks like one
     /// folded at level 5 — so it is worth saying which one you got.
@@ -1944,10 +1945,16 @@ impl App {
             self.set_status("nothing to filter: these records have no object keys", true);
             return;
         }
+        // The menu opens in the shape of the record under the cursor: the keys
+        // that record has unfolded are the keys it lists the contents of.
+        let entry = doc.cursor_entry();
         self.keys.undo = Some(doc.keys().clone());
         self.keys.edited = false;
         self.mode = Mode::Keys;
         self.status = None;
+        if let (Some(doc), Some(entry)) = (self.jsonl_mut(), entry) {
+            doc.open_keys_to(entry);
+        }
         self.clamp_keys_cursor();
     }
 
@@ -2011,6 +2018,7 @@ impl App {
             .jsonl_mut()
             .is_some_and(|doc| doc.fold_keys(&path, open));
         if moved {
+            self.fold_zoom_to_keys();
             self.clamp_keys_cursor();
             return;
         }
@@ -2021,6 +2029,24 @@ impl App {
                 self.focus_keys_cursor();
             }
         }
+    }
+
+    /// Bring the record being read to the shape the menu is now unfolded to, so
+    /// the key being switched is a key on show behind it. The other half of the
+    /// sync `open_keys` starts: the menu follows the record it is opened over,
+    /// and that record follows the menu from then on.
+    ///
+    /// Only that one record. The rest of the file is left as it was — opening
+    /// the whole of it is what `a` is for, and it is not what somebody unfolding
+    /// a key in the menu asked for.
+    fn fold_zoom_to_keys(&mut self) {
+        let Some(doc) = self.jsonl_mut() else {
+            return;
+        };
+        let Some(entry) = doc.cursor_entry() else {
+            return;
+        };
+        doc.open_entry_to_keys(entry);
     }
 
     pub fn keys_set_all(&mut self, enabled: bool) {

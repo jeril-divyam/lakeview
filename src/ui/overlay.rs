@@ -96,8 +96,10 @@ const INDENT: &str = "  ";
 /// Space kept between a menu line and either border, so the selection bar has
 /// room to breathe without the block's padding eating into it.
 const MARGIN: &str = " ";
-/// Space kept clear of the zoom around the menu, as (columns, rows), so the
-/// panel reads as sitting over the file rather than being part of it.
+/// Room kept between the menu and the edges of the zoom, as (columns, rows), so
+/// the panel reads as sitting over the file rather than being part of it. The
+/// columns are also cleared either side of it; the rows only hold it off the
+/// pane's own borders — see the clearing below.
 const GAP: (u16, u16) = (2, 1);
 
 /// The key filter: the keys the zoomed records use, as a tree that unfolds one
@@ -162,17 +164,16 @@ pub fn keys(frame: &mut Frame, app: &mut App, area: Rect) {
         .title_bottom(footer);
     let list = block.inner(popup);
 
-    // Clear the gap along with the menu, so the file behind does not run right
-    // up against the border. The rows above and below are cleared right across
-    // the pane rather than to the panel's own width: half a row of a record,
-    // or a line number with nothing after it, reads as a rendering fault.
-    for band in [
-        Rect::new(area.x, popup.y.saturating_sub(GAP.1), area.width, GAP.1),
-        Rect::new(area.x, popup.bottom(), area.width, GAP.1),
-        grow(popup, (GAP.0, 0)),
-    ] {
-        frame.render_widget(Clear, band.intersection(area));
-    }
+    // Clear a column or two either side of the menu, so the file behind does
+    // not run right up against its border. Only to the sides: a row cleared
+    // right across the pane costs a whole line of the record — the panel's own
+    // border is separation enough above and below it.
+    let band = grow(popup, (GAP.0, 0)).intersection(area);
+    frame.render_widget(Clear, band);
+    // `Clear` empties a cell to the terminal's own default, which is not the
+    // theme's background: left at that, the margin reads as a dark stripe laid
+    // over the file rather than as a piece of the page.
+    frame.render_widget(Block::new().style(Theme::base()), band);
     frame.render_widget(block, popup);
 
     app.keys.popup = popup;

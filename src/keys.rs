@@ -127,6 +127,42 @@ impl KeyFilter {
         self.recount();
     }
 
+    /// Whether the menu is listing the keys under `path` — the key names from a
+    /// record's root down, array indices left out, an array being no level of
+    /// naming here.
+    pub fn is_open<S: AsRef<str>>(&self, path: &[S]) -> bool {
+        let mut nodes = &self.roots;
+        let mut open = false;
+        for key in path {
+            let Some(node) = nodes.iter().find(|n| n.key == key.as_ref()) else {
+                return false;
+            };
+            open = node.open;
+            nodes = &node.children;
+        }
+        open
+    }
+
+    /// Unfold exactly the keys `paths` names and fold every other, so the menu
+    /// takes the shape of the record it was opened over. A key on the way down
+    /// to one of them opens with it: the menu cannot list a key whose parent it
+    /// isn't listing.
+    pub fn open_only(&mut self, paths: &[Vec<String>]) {
+        fold_all(&mut self.roots);
+        for path in paths {
+            let mut nodes = &mut self.roots;
+            for key in path {
+                let Some(at) = nodes.iter().position(|n| n.key == *key) else {
+                    break;
+                };
+                let node = &mut nodes[at];
+                // A key with nothing under it lists nothing, marked or not.
+                node.open = !node.children.is_empty();
+                nodes = &mut node.children;
+            }
+        }
+    }
+
     /// Unfold or fold a node in the menu, reporting whether anything moved.
     pub fn set_open(&mut self, path: &[usize], open: bool) -> bool {
         match self.node_mut(path) {
@@ -221,6 +257,13 @@ fn collect(nodes: &[Node], path: &mut Vec<usize>, rows: &mut Vec<MenuRow>) {
     }
 }
 
+fn fold_all(nodes: &mut [Node]) {
+    for node in nodes.iter_mut() {
+        node.open = false;
+        fold_all(&mut node.children);
+    }
+}
+
 fn set_all(nodes: &mut [Node], enabled: bool) {
     for node in nodes {
         node.enabled = enabled;
@@ -305,6 +348,47 @@ mod tests {
         assert!(f.set_open(&path(&f, "a"), false));
         assert!(!f.set_open(&path(&f, "a"), false));
         assert_eq!(keys(&f), ["a", "d"]);
+    }
+
+    /// What the records are folded to match: the keys the menu is listing the
+    /// contents of.
+    #[test]
+    fn a_path_is_open_when_the_menu_lists_the_keys_under_it() {
+        let mut f = filter(&[r#"{"a":{"b":{"c":1}},"d":2}"#]);
+        assert!(!f.is_open(&["a"]));
+
+        f.set_open(&path(&f, "a"), true);
+        assert!(f.is_open(&["a"]));
+        assert!(!f.is_open(&["a", "b"]), "b is listed, not unfolded");
+
+        // Neither a key that isn't there nor the root itself is a key that is
+        // open — a record has to be asked about something.
+        assert!(!f.is_open(&["a", "zzz"]));
+        assert!(!f.is_open(&["zzz"]));
+        assert!(!f.is_open::<&str>(&[]));
+    }
+
+    /// And the menu folded to match a record.
+    #[test]
+    fn open_only_folds_the_menu_to_the_paths_it_is_given() {
+        let mut f = filter(&[r#"{"a":{"b":{"c":1}},"d":{"e":2}}"#]);
+        f.open_only(&[vec!["a".into(), "b".into()]]);
+        assert_eq!(keys(&f), ["a", "  b", "    c", "d"]);
+
+        // Whatever was open and is not named this time folds back up.
+        f.open_only(&[vec!["d".into()]]);
+        assert_eq!(keys(&f), ["a", "d", "  e"]);
+
+        f.open_only(&[]);
+        assert_eq!(keys(&f), ["a", "d"]);
+    }
+
+    #[test]
+    fn open_only_passes_over_a_key_that_is_not_there() {
+        let mut f = filter(&[r#"{"a":1,"b":{"c":2}}"#]);
+        f.open_only(&[vec!["zzz".into()], vec!["a".into()], vec!["b".into()]]);
+        // "a" has nothing under it to list, marked or not.
+        assert_eq!(keys(&f), ["a", "b", "  c"]);
     }
 
     #[test]

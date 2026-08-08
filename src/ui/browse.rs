@@ -1579,6 +1579,173 @@ mod tests {
         assert!(!all.contains("key hidden"), "{all}");
     }
 
+    /// The rows of the zoomed document, as plain text. The menu is drawn over
+    /// the records, so what they read at is asked of the document rather than
+    /// of the screen behind the panel.
+    fn doc_rows(app: &App) -> Vec<String> {
+        app.jsonl()
+            .expect("a zoomed jsonl")
+            .rows()
+            .iter()
+            .map(|row| row.cells.iter().map(|(_, text)| text.as_str()).collect())
+            .collect()
+    }
+
+    /// A record whose keys sit inside an array. The menu has no level for the
+    /// array — it lists the keys inside `"spans": [{…}]` directly under
+    /// `spans` — so unfolding a key it lists two deep has to reach three
+    /// containers into the record.
+    #[tokio::test]
+    async fn a_key_inside_an_array_unfolds_the_record_through_it() {
+        let mut app = test_app();
+        let record = r#"{"spans":[{"name":"x","status":{"code":"OK"}}]}"#;
+        app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(
+            &format!("{record}\n"),
+            false,
+        )));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+
+        app.open();
+        app.open_keys();
+        // The cursor starts on "spans", the only key a folded record shows.
+        app.keys_fold(true);
+        let rows = doc_rows(&app);
+        assert!(
+            rows.iter().any(|r| r.contains(r#"▾ "spans": ["#)),
+            "{rows:?}"
+        );
+
+        // "status" is listed under it now; unfolding that has to reach past the
+        // array and its element to the key itself.
+        let at = app
+            .keys_rows()
+            .iter()
+            .position(|r| r.key == "status")
+            .expect("status is listed under spans");
+        app.keys_select(at);
+        app.keys_fold(true);
+
+        let rows = doc_rows(&app);
+        assert!(
+            rows.iter().any(|r| r.contains(r#"▾ "status": {"#)),
+            "the record follows the menu through the array: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains(r#""code": "OK""#)),
+            "{rows:?}"
+        );
+    }
+
+    /// The menu and the record keep the same shape: it opens in the shape of the
+    /// record the cursor is in, and unfolding a key unfolds that key in it.
+    #[tokio::test]
+    async fn the_menu_and_the_record_keep_the_same_shape() {
+        let mut app = test_app();
+        let record = r#"{"a":1,"m":{"p":2,"q":{"r":3}}}"#;
+        app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(
+            &format!("{record}\n{record}\n"),
+            false,
+        )));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+
+        // Open the record under the cursor to its top level: the menu opens
+        // listing the keys that record is showing, and no deeper.
+        app.open();
+        app.open_keys();
+        let all = screen(&framed(&mut app, 60, 24));
+        assert!(all.contains("[x] a") && all.contains("[x] m"), "{all}");
+        assert!(!all.contains("[x] p"), "deeper than the record: {all}");
+
+        // Unfolding "m" in the menu unfolds it in the record being read — and
+        // there alone: the other record is left folded as it was.
+        app.keys_move(1);
+        app.keys_fold(true);
+        let all = screen(&framed(&mut app, 60, 24));
+        assert!(all.contains("[x] p") && all.contains("[x] q"), "{all}");
+        let rows = doc_rows(&app);
+        assert_eq!(
+            rows.iter().filter(|r| r.contains(r#"▾ "m": {"#)).count(),
+            1,
+            "{rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains(r#"▸ "q": {"#)).count(),
+            1,
+            "and no further than the menu goes: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.starts_with("▸ {")).count(),
+            1,
+            "the record that was not being read is untouched: {rows:?}"
+        );
+
+        // And folding it back up takes that record with it again.
+        app.keys_fold(false);
+        let all = screen(&framed(&mut app, 60, 24));
+        assert!(!all.contains("[x] p"), "{all}");
+        let rows = doc_rows(&app);
+        assert_eq!(
+            rows.iter().filter(|r| r.contains(r#"▸ "m": {"#)).count(),
+            1,
+            "{rows:?}"
+        );
+    }
+
+    /// A record folded onto its own row has no level to lend, so the menu opens
+    /// as it always did — the keys the records are made of, one level deep.
+    #[tokio::test]
+    async fn the_menu_over_a_folded_record_opens_at_its_first_level() {
+        let mut app = test_app();
+        app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(
+            "{\"a\":1,\"m\":{\"p\":2}}\n",
+            false,
+        )));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+
+        app.open_keys();
+        let all = screen(&framed(&mut app, 60, 20));
+        assert!(all.contains("[x] a") && all.contains("[x] m"), "{all}");
+        assert!(!all.contains("[x] p"), "{all}");
+    }
+
+    /// The menu is a panel over the file, not a hole in it: the rows it doesn't
+    /// cover keep their records, and only a column either side is cleared.
+    #[tokio::test]
+    async fn the_menu_does_not_cost_the_rows_around_it() {
+        let mut app = test_app();
+        let text: String = (0..30)
+            .map(|i| format!("{{\"n\":{i},\"m\":{{\"p\":{i}}}}}\n"))
+            .collect();
+        app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(&text, false)));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+        app.open_keys();
+
+        let buffer = framed(&mut app, 80, 24);
+        let popup = app.keys.popup;
+        let row = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+
+        let above = row(popup.y - 1);
+        let below = row(popup.bottom());
+        assert!(above.contains(r#""n": "#), "{above:?}");
+        assert!(below.contains(r#""n": "#), "{below:?}");
+
+        // The columns either side of it stay clear, so no record runs into the
+        // border.
+        let y = popup.y + 1;
+        assert_eq!(buffer[(popup.x - 1, y)].symbol(), " ");
+        assert_eq!(buffer[(popup.right(), y)].symbol(), " ");
+        // And clear in the theme's own background, not the terminal's.
+        assert_eq!(buffer[(popup.x - 1, y)].bg, Theme::BG);
+    }
+
     #[tokio::test]
     async fn a_click_on_a_menu_line_switches_that_key() {
         let mut app = test_app();

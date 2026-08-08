@@ -112,6 +112,77 @@ fn fill(open: &mut Open, value: &Value, levels: usize) {
     }
 }
 
+/// The fold state a record takes to match the key menu: a container is open
+/// when the menu is listing the keys under the key that names it.
+///
+/// An array is no level of naming — the menu puts the keys inside
+/// `"spans": [{…}]` directly under `spans` — so an array and its elements open
+/// with the key itself, however many of them are nested. Counting levels instead
+/// would have the two describing different things the moment a record holds a
+/// list of objects, which is most of what JSONL is for.
+fn opened_like(value: &Value, filter: &KeyFilter) -> Open {
+    let mut open = Open::default();
+    fill_like(&mut open, value, filter, &mut Vec::new());
+    open
+}
+
+fn fill_like(open: &mut Open, value: &Value, filter: &KeyFilter, path: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map {
+                // Only what folds is asked about; a scalar has no state to take.
+                if brackets(val).is_none() {
+                    continue;
+                }
+                path.push(key.clone());
+                if filter.is_open(path) {
+                    let child = open.children.entry(Seg::Key(key.clone())).or_default();
+                    child.open = true;
+                    fill_like(child, val, filter, path);
+                }
+                path.pop();
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                if brackets(item).is_none() {
+                    continue;
+                }
+                let child = open.children.entry(Seg::Index(i)).or_default();
+                child.open = true;
+                fill_like(child, item, filter, path);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The reverse: the key paths a record has open, named the way the menu names
+/// them. Array indices are left out, the menu having no node for one.
+fn open_key_paths(value: &Value, open: &Open, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map {
+                let Some(child) = child(Some(open), &Seg::Key(key.clone())) else {
+                    continue;
+                };
+                path.push(key.clone());
+                out.push(path.clone());
+                open_key_paths(val, child, path, out);
+                path.pop();
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                if let Some(child) = child(Some(open), &Seg::Index(i)) {
+                    open_key_paths(item, child, path, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The child at `seg` if it is unfolded, `None` if it is folded or untouched.
 fn child<'a>(open: Option<&'a Open>, seg: &Seg) -> Option<&'a Open> {
     open?.children.get(seg).filter(|c| c.open)
@@ -811,6 +882,49 @@ impl Doc {
     pub fn fold_keys(&mut self, path: &[usize], open: bool) -> bool {
         self.filter.set_open(path, open)
     }
+
+    /// The record the cursor is in.
+    pub fn cursor_entry(&self) -> Option<usize> {
+        self.rows().get(self.cursor).map(|row| row.entry)
+    }
+
+    /// Open the menu to match a record: a key whose value that record shows
+    /// open is a key the menu lists the keys under. What `F` does on the way in,
+    /// so the menu opens describing what is already on screen.
+    ///
+    /// Nothing about what the records show changes, so — like `fold_keys` — the
+    /// file is not re-pruned.
+    pub fn open_keys_to(&mut self, entry: usize) {
+        let mut paths = Vec::new();
+        if let Some(record) = self.entries.get(entry)
+            && let Some(value) = record.shown()
+        {
+            open_key_paths(value, &record.open, &mut Vec::new(), &mut paths);
+        }
+        self.filter.open_only(&paths);
+    }
+
+    /// The same sync the other way: open one record to match the menu, leaving
+    /// the rest of the file as it was. What `←`/`→` in the menu moves — the
+    /// whole file is `a`'s business, not the menu's.
+    pub fn open_entry_to_keys(&mut self, entry: usize) {
+        let Some(record) = self.entries.get(entry) else {
+            return;
+        };
+        let open = match record.shown() {
+            Some(value) => opened_like(value, &self.filter),
+            None => Open::default(),
+        };
+        let record = &mut self.entries[entry];
+        // The record itself has to be open for any of this to be on show. A menu
+        // with nothing unfolded leaves it at its top level, which is the shape
+        // the menu's own roots describe.
+        record.expanded = true;
+        record.open = open;
+        // Its rows have all been rebuilt under the cursor, and everything below
+        // it has shifted; the record is what there is to hold on to.
+        self.land_on(Some(entry));
+    }
 }
 
 impl Folding for Doc {
@@ -870,17 +984,22 @@ impl Folding for Doc {
         self.land_on(anchor);
     }
 
-    /// Sitting on something folded, `a` means "open all of this" — there is no
-    /// level to copy, and the file is a shape repeated, so all of it means all of
-    /// every record. Sitting on something open, it means "the rest like this
-    /// one", and the level to copy is the one the cursor's record reads at.
+    /// The level to copy is the one the cursor's *record* reads at, from
+    /// wherever inside it the cursor sits — the folded rows within an open
+    /// record included. A record open to level 2 with the cursor on a folded row
+    /// inside it is still a record open to level 2, and "the rest like this one"
+    /// is what `a` means anywhere in it.
+    ///
+    /// Only a record folded onto its own row has no level to copy. There `a`
+    /// means "open all of this", and the file being a shape repeated, all of it
+    /// means all of every record.
     fn expand_target(&self) -> Option<usize> {
         let rows = self.rows();
         let row = rows.get(self.cursor)?;
-        if row.folded {
-            return None;
+        match self.record_depth(row.entry) {
+            0 => None,
+            depth => Some(depth),
         }
-        Some(self.record_depth(row.entry))
     }
 
     /// Ascends the way it does in the tree, and gives way only once the record
@@ -1416,21 +1535,53 @@ mod tests {
         );
     }
 
-    /// A folded row inside an open record says the same thing: nothing is open
-    /// here, so open everything.
+    /// A folded row inside an open record is still inside that record, so `a`
+    /// there copies the record's level rather than opening the file whole.
     #[test]
-    fn expand_all_on_a_folded_row_inside_a_record_opens_all_of_it_too() {
+    fn expand_all_on_a_folded_row_inside_a_record_copies_the_records_level() {
         let mut doc = nested();
         doc.toggle_row(0); // open the first record; row 3 is its folded "m"
         assert!(doc.rows()[3].folded);
         doc.set_cursor(3);
-        assert_eq!(doc.expand_all(), None);
+
+        assert_eq!(doc.expand_all(), Some(1));
+        let rows = rendered(&doc);
         assert_eq!(
-            rendered(&doc)
-                .iter()
-                .filter(|r| r.contains("▾ \"q\""))
-                .count(),
-            2
+            rows.iter().filter(|r| r.contains("▸ \"m\": {")).count(),
+            2,
+            "both records open to their top level: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("▾ \"m\"")),
+            "the level the cursor's record read at is not opened past: {rows:?}"
+        );
+    }
+
+    /// And the same a level further in: what counts is how deep the record is
+    /// open, not which of its rows the cursor happens to be resting on.
+    #[test]
+    fn a_folded_row_deeper_in_copies_the_deeper_level() {
+        let mut doc = nested();
+        doc.toggle_row(0); // the record
+        doc.toggle_row(3); // its "m", leaving "q" folded inside
+        let q = doc
+            .rows()
+            .iter()
+            .position(|r| r.folded && r.cells.iter().any(|(_, t)| t.contains("\"q\"")))
+            .expect("the folded \"q\" row");
+        doc.set_cursor(q);
+
+        assert_eq!(doc.expand_all(), Some(2));
+        let rows = rendered(&doc);
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("▾ \"m\": {")).count(),
+            2,
+            "{rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("▸ \"q\": {")).count(),
+            2,
+            "{rows:?}"
         );
     }
 
@@ -1471,6 +1622,80 @@ mod tests {
             rows.iter().all(|r| !r.contains("▾ \"m\"")),
             "nothing is left open past level 1: {rows:?}"
         );
+    }
+
+    /// The menu's lines, indented by the level they are listed at.
+    fn menu(doc: &Doc) -> Vec<String> {
+        doc.keys()
+            .rows()
+            .iter()
+            .map(|r| format!("{}{}", "  ".repeat(r.depth()), r.key))
+            .collect()
+    }
+
+    /// What the key menu moves: one record, the rest of the file left alone.
+    #[test]
+    fn only_the_record_being_read_takes_the_menus_shape() {
+        let mut doc = nested();
+        doc.fold_keys(&key_path(&doc, "m"), true);
+        doc.open_entry_to_keys(1);
+
+        assert_eq!(doc.record_depth(1), 2, "open down to the key the menu lists");
+        assert_eq!(doc.record_depth(0), 0, "the other record is untouched");
+
+        // The cursor lands on the record that moved, whatever it was on before.
+        assert_eq!(doc.rows()[doc.cursor()].entry, 1);
+        assert_eq!(doc.rows()[doc.cursor()].sub, 0);
+
+        // Folding the key back up takes that record back with it.
+        doc.fold_keys(&key_path(&doc, "m"), false);
+        doc.open_entry_to_keys(1);
+        assert_eq!(doc.record_depth(1), 1, "left at its own top level");
+
+        // A record that isn't there is not worth a panic.
+        doc.open_entry_to_keys(9);
+    }
+
+    /// The menu and a record keep the same *shape*, not the same depth: an
+    /// array is no level of naming in the menu, so a key listed two deep there
+    /// can sit three containers deep in the record.
+    #[test]
+    fn a_record_opens_to_match_the_menu_through_an_array() {
+        let mut doc = doc(&[r#"{"spans":[{"name":"x","status":{"code":"OK"}}]}"#]);
+        doc.fold_keys(&key_path(&doc, "spans"), true);
+        doc.fold_keys(&key_path(&doc, "status"), true);
+        doc.open_entry_to_keys(0);
+
+        let rows = rendered(&doc);
+        assert!(rows.iter().any(|r| r.contains(r#"▾ "spans": ["#)), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains(r#"▾ "status": {"#)),
+            "the array between them is opened along with the key: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.contains(r#""code": "OK""#)), "{rows:?}");
+
+        // A key the menu does not list the contents of stays folded, however
+        // deep the ones beside it are opened.
+        doc.fold_keys(&key_path(&doc, "status"), false);
+        doc.open_entry_to_keys(0);
+        let rows = rendered(&doc);
+        assert!(rows.iter().any(|r| r.contains(r#"▸ "status": {"#)), "{rows:?}");
+    }
+
+    #[test]
+    fn the_menu_opens_to_match_the_record_it_is_opened_over() {
+        let mut doc = doc(&[r#"{"spans":[{"name":"x","status":{"code":"OK"}}]}"#]);
+        assert_eq!(menu(&doc), ["spans"], "folded: the record's own keys");
+
+        // The record open all the way through the array, as `a` would leave it.
+        doc.expand_to(4);
+        doc.open_keys_to(0);
+        assert_eq!(menu(&doc), ["spans", "  name", "  status", "    code"]);
+
+        // And folded back to its top level, the menu comes back with it.
+        doc.expand_to(1);
+        doc.open_keys_to(0);
+        assert_eq!(menu(&doc), ["spans"]);
     }
 
     #[test]

@@ -217,11 +217,13 @@ whole record is folded again does it leave the zoom. `Esc` leaves at once.
 
 ### All at once
 
-`a` reads what the cursor is on. On something **folded** there is no level to
-copy, so it opens **all of it** — every record, all the way down. On something
-**open** it means "the rest like this one", and brings every record to the level
-the one you are on is open to: having unfolded one record's `meta`, `a` gives you
-the whole file that way.
+`a` reads the record the cursor is in. On a **folded** record there is no level
+to copy, so it opens **all of it** — every record, all the way down. Inside an
+**open** one it means "the rest like this one", and brings every record to the
+level that record is open to: having unfolded one record's `meta`, `a` gives you
+the whole file that way. Anywhere inside the record does, the folded rows within
+it included — what counts is how deep the record is open, not which of its rows
+you are resting on.
 
 Levelling off folds as well as unfolds — a record somebody had opened deeper than
 the level goes back to it, so "every record at level 2" is what you get rather
@@ -272,6 +274,14 @@ can be switched off:
 `a`/`n` switch all or none, `Enter` closes the menu and `Esc` puts the old filter
 back. The records change behind the menu as you switch keys, so what you are
 choosing is on show while you choose it.
+
+The menu and the record you are reading keep the same shape. `F` opens it
+unfolded exactly as far as that record is, so it lists the keys the record is
+showing and no more, and `←`/`→` unfold and fold that key in the record from then
+on — the key under the cursor is always one whose values are on show behind it.
+An array is no level of naming here, so unfolding `spans` where the records hold
+`"spans": [{…}]` opens the list and its entries along with it. The rest of the
+file stays as you left it; opening the whole of it is what `a` is for.
 
 Switching a key off takes everything nested under it with it, and switching one
 back on clears the way down to it, so a `[x]` always means a key you will
