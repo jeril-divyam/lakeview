@@ -1292,6 +1292,11 @@ mod tests {
         assert!(all.contains(r#"▾ "b": {"#), "{all}");
         assert!(all.contains("\"c\": 2"), "{all}");
 
+        // And `→` again leaves it open: descending is one direction.
+        app.open();
+        let again = render(&mut app, 60, 12).join("\n");
+        assert_eq!(again, all, "`→` on an open row folded it");
+
         // `←` folds it straight back up.
         app.back();
         let all = render(&mut app, 60, 12).join("\n");

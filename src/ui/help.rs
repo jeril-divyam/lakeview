@@ -41,8 +41,8 @@ you had open. Set ui.mouse = false to hand the mouse back to your terminal.";
 
 const FOLDING: &str = "A zoomed .json opens one level down: the root's own members, with every \
 object and array inside them folded onto a row each. A zoomed .jsonl folds one step further, \
-listing its records a row apiece. →, Enter or space unfolds the selected row a level at a time, \
-and folds it back up from its opening row or its closing bracket either way. ← winds back out, \
+listing its records a row apiece. →, Enter or space unfolds the selected row a level at a time; \
+space folds it back up too, from its opening row or its closing bracket either way. ← winds back out, \
 folding what is open and stepping out of what is not, and leaves the zoom only once nothing is \
 left to close; Esc leaves at once. Folded rows are truncated — unfolding is how you see the rest \
 — and everything else wraps. a on a folded row unfolds the whole document, all the way down; on \

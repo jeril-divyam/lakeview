@@ -172,10 +172,11 @@ under it are what you go looking for.
 ╰─────────────────────────────────────────────────────╯
 ```
 
-`→`, `Enter` or `space` unfolds the selected row a level at a time, and folds it
-back up from its opening row or its closing bracket either way. `←` winds back
-out the way it does in the tree, and leaves the zoom once nothing is left to
-close. The file's own brackets don't fold — collapsing a whole file to `{…}`
+`→`, `Enter` or `space` unfolds the selected row a level at a time. `space` folds
+it back up as well, from its opening row or its closing bracket either way; `→`
+only ever opens, so pressing it on something already open leaves it alone. `←`
+winds back out the way it does in the tree, and leaves the zoom once nothing is
+left to close. The file's own brackets don't fold — collapsing a whole file to `{…}`
 says nothing.
 
 Line numbers count the rows on show, so folding a block renumbers what is under
@@ -208,8 +209,9 @@ on a row each, marked `▸`, and unfold a level at a time in turn:
 ╰──────────────────────────────────────────────────────╯
 ```
 
-The same keys fold a block back up, from its opening row or its closing bracket
-either way, and what was open inside it is remembered.
+`space` folds a block back up, from its opening row or its closing bracket either
+way, and what was open inside it is remembered. `→` and `Enter` only unfold —
+descending is one direction, as it is in the tree.
 
 `←` winds back out the way it does in the tree: it folds what is open, steps out
 to the enclosing block when there is nothing there to fold, and only once the

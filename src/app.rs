@@ -1716,11 +1716,13 @@ impl App {
     /// `→` — descend: expand a repository or directory, move focus at the pane
     /// edges, zoom a file.
     pub fn open(&mut self) {
-        // Already zoomed: descending means unfolding the selected record, and
-        // there is nothing else left to open.
+        // Already zoomed: descending means unfolding the selected row, and there
+        // is nothing else left to open. Unfolding only — `→` on something
+        // already open does nothing, as it does on an open directory in the
+        // tree. `←` folds, and `space` toggles.
         if self.zoomed() {
             if let Some(doc) = self.zoom_doc_mut() {
-                doc.toggle_cursor();
+                doc.expand_cursor();
             }
             return;
         }

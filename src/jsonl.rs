@@ -546,6 +546,19 @@ pub trait Folding {
     fn toggle_cursor(&mut self) {
         self.toggle_row(self.cursor());
     }
+
+    /// Whether `row` shows something folded up — something `→` has to open.
+    fn folded(&self, row: usize) -> bool;
+
+    /// `→` — unfold what the cursor is on, and only unfold. Descending is one
+    /// direction: a key that shuts what it just opened cannot be held down, and
+    /// it leaves you having to look at a row to know what pressing it will do.
+    /// `←` folds, and `space` is the one that does both.
+    fn expand_cursor(&mut self) {
+        if self.folded(self.cursor()) {
+            self.toggle_row(self.cursor());
+        }
+    }
 }
 
 // ── a whole JSON file ────────────────────────────────────────────────────
@@ -592,6 +605,10 @@ impl Folding for JsonDoc {
 
     fn set_cursor(&mut self, row: usize) {
         self.cursor = row;
+    }
+
+    fn folded(&self, row: usize) -> bool {
+        self.rows().get(row).is_some_and(|r| r.folded)
     }
 
     fn toggle_row(&mut self, row: usize) {
@@ -940,6 +957,12 @@ impl Folding for Doc {
         self.cursor = row;
     }
 
+    /// A record folded onto its own row counts as folded, like any other row
+    /// showing a value it has not opened.
+    fn folded(&self, row: usize) -> bool {
+        self.rows().get(row).is_some_and(|r| r.folded)
+    }
+
     /// A record's own row folds the whole record; a body row folds the container
     /// it names, one level at a time.
     fn toggle_row(&mut self, row: usize) {
@@ -1125,6 +1148,51 @@ mod tests {
             rendered(&doc),
             ["▾ {1}", "{", "▾ \"a\": {", "  ▸ \"b\": {\"c\": 1}", "  }", "}"]
         );
+    }
+
+    /// `→` only ever opens. Pressing it again on what it just opened has to
+    /// leave it open, or the key means two different things a row apart.
+    #[test]
+    fn expanding_twice_leaves_it_open() {
+        let mut doc = nested();
+        doc.expand_cursor();
+        assert_eq!(doc.record_depth(0), 1);
+        doc.expand_cursor();
+        assert_eq!(doc.record_depth(0), 1, "still open");
+
+        // The same a level in: open "m", press again, still open.
+        let m = doc
+            .rows()
+            .iter()
+            .position(|r| r.folded && r.cells.iter().any(|(_, t)| t.contains("\"m\"")))
+            .expect("the folded \"m\" row");
+        doc.set_cursor(m);
+        doc.expand_cursor();
+        assert_eq!(doc.record_depth(0), 2);
+        doc.expand_cursor();
+        assert_eq!(doc.record_depth(0), 2, "still open");
+
+        // `space` is the key that does both, and still folds it back up.
+        doc.toggle_cursor();
+        assert_eq!(doc.record_depth(0), 1);
+    }
+
+    #[test]
+    fn json_expanding_twice_leaves_it_open() {
+        let mut doc = json(r#"{"a":{"b":1}}"#);
+        doc.set_cursor(1);
+        doc.expand_cursor();
+        let open = json_rendered(&doc);
+        assert!(open.iter().any(|r| r.contains(r#"▾ "a": {"#)), "{open:?}");
+
+        doc.expand_cursor();
+        assert_eq!(json_rendered(&doc), open, "pressing it again changes nothing");
+
+        // A closing bracket folds its block for `←` and `space`; `→` there is
+        // not a way to fold it either.
+        doc.set_cursor(3);
+        doc.expand_cursor();
+        assert_eq!(json_rendered(&doc), open);
     }
 
     #[test]
