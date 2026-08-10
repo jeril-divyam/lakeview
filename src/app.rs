@@ -83,9 +83,6 @@ pub struct PreviewPayload {
     pub bytes: Vec<u8>,
     /// The fetch came back at `preview_bytes`, so this is not the whole object.
     pub truncated: bool,
-    /// The commit that last changed the object, fetched alongside its bytes.
-    /// `None` when the log doesn't name one, or wouldn't answer.
-    pub commit: Option<String>,
 }
 
 // ── shared bits ──────────────────────────────────────────────────────────
@@ -347,8 +344,6 @@ impl TreeView {
                 path: String::new(),
                 path_type: "common_prefix".into(),
                 size_bytes: None,
-                mtime: 0,
-                content_type: None,
             },
             name: String::new(),
             depth: 0,
@@ -533,9 +528,6 @@ pub struct Preview {
     pub key: Option<(String, String, String)>,
     pub stat: Option<ObjectStats>,
     pub body: Option<PreviewBody>,
-    /// The commit that last changed this object, once its fetch lands. Belongs
-    /// to `key`'s path, so the detail pane checks that before naming it.
-    pub commit: Option<String>,
     pub error: Option<String>,
     pub loading: bool,
     pub scroll: u16,
@@ -1125,19 +1117,13 @@ impl App {
         let (tx, client) = (self.tx.clone(), self.client.clone());
         let limit = self.cfg.ui.preview_bytes;
         tokio::spawn(async move {
-            // Both halves of one selection, so the round trips overlap rather
-            // than the details waiting on the bytes. A log that won't answer
-            // costs the commit, not the preview.
-            let (bytes, commit) = tokio::join!(
-                client.get_object_head(&repo, &reference, &object.path, limit),
-                client.last_commit(&repo, &reference, &object.path),
-            );
-            let res = bytes
+            let res = client
+                .get_object_head(&repo, &reference, &object.path, limit)
+                .await
                 .map(|bytes| PreviewPayload {
                     truncated: bytes.len() as u64 >= limit,
                     stat: object,
                     bytes,
-                    commit: commit.ok().flatten(),
                 })
                 .map_err(fmt_err);
             let _ = tx.send(Msg::Preview(req, res));
@@ -1441,7 +1427,6 @@ impl App {
                             payload.truncated,
                         ));
                         self.preview.stat = Some(payload.stat);
-                        self.preview.commit = payload.commit;
                     }
                     Err(e) => self.preview.error = Some(e),
                 }

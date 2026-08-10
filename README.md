@@ -13,12 +13,12 @@ configurable ratio.
 ╰────────────────────────────────────────────────────────────────────────────────╯
 ╭ Repositories ─── 2 ╮╭ main ──────────────── 6 ╮╭ daily_rollup.json ──────────╮
 │                    ││                         ││                             │
-│ ▾ quickstart   main││ ▾ data/                 ││ size            56 B        │
-│     ● main  a3f01b2││   ▾ curated/            ││ modified        10:59       │
-│     ○ dev   77c19ee││    ▌  daily_ro…    56 B ││ type            json        │
-│     ◇ v1.0  1b2c3d4││   ▸ raw/                ││ ──────────────────────────  │
-│ ● analytics    main││ ▸ images/               ││  1 {                        │
-│                    ││   README.md       120 B ││  2   "clicks": 2,           │
+│ ▾ quickstart   main││ ▾ data/                 ││  1 {                        │
+│     ● main  a3f01b2││   ▾ curated/            ││  2   "name": "daily_rollup",│
+│     ○ dev   77c19ee││    ▌  daily_ro…    56 B ││  3   "clicks": 2,           │
+│     ◇ v1.0  1b2c3d4││   ▸ raw/                ││  4   "tags": [              │
+│ ● analytics    main││ ▸ images/               ││  5     "a",                 │
+│                    ││   README.md       120 B ││  6     "b"                  │
 ╰────────────────────╯╰─────────────────────────╯╰─────────────────────────────╯
     ↑↓/jk move  →/l open  ←/h back  space toggle  / search  d download  q quit
 ```
@@ -189,7 +189,10 @@ it. The document is re-indented from the parsed value, so there is no original
 line number to keep.
 
 The side pane leaves the folding alone and shows the whole file laid flat: at
-that width there is no room to fold anything usefully.
+that width there is no room to fold anything usefully. It does wrap, though — a
+file is one value read top to bottom, so a long string in the middle of it is
+worth the lines it takes, and continuations hang under the nesting so the shape
+still reads down the pane.
 
 ## JSONL
 
@@ -252,7 +255,9 @@ Everything else wraps, so the long values an unfolded record exposes are
 readable at full width.
 
 The side pane doesn't fold — at that width there is no room to usefully — but it
-gives each record a line, syntax-coloured like the JSON preview beside it. The
+gives each record a line, syntax-coloured like the JSON preview beside it, and
+lets a long one overflow rather than wrapping it: a record is a row of its own
+here, and re-flowing one over ten lines would bury the records under it. The
 records are re-spaced to be coloured at all, so what it shows is the JSON each
 line holds rather than its exact bytes; the zoom is the same. A record that isn't
 valid JSON keeps its raw text, in red with the parse error beside it, and unfolds
@@ -338,20 +343,15 @@ selection, set `mouse = false` under `[ui]` and everything stays keyboard-driven
 
 - Listings are paginated transparently and sorted directories-first.
 - Directories are fetched one level at a time, as you open them.
-- A selected file's details name its `artifact ref` — its path, and the commit
-  that last changed it, as
-  `/judges/bespoke/answer-accuracy.json?ref=afa67f66…`. A leading `user/` or
-  `system/` is left off, since those partition a repository rather than being
-  part of the path inside one; any other first segment is kept. The commit is
-  found by the log of one object, fetched alongside the preview, so it names the
-  version you are actually looking at rather than wherever the branch has since
-  moved to. Until it lands — or if the object has no commit behind it yet — the
-  ref you are browsing stands in.
+- A selected file's pane is its contents and nothing else. Its size is already
+  on its row in the tree, and the rest of what lakeFS knows about the object is
+  not what you opened the pane to read. A prefix still names itself, since it
+  has no contents to show.
 - Text previews are capped at `preview_bytes`; binary content falls back to a
   hex dump.
-- The zoomed preview wraps long lines, hanging continuations under the content
-  so the line numbers stay readable. The side pane lets them overflow instead —
-  at that width, wrapping one long JSON string would bury the rest of the file.
+- Long lines wrap in both the zoom and the side pane, hanging continuations
+  under the content so the line numbers stay readable. A folded `.jsonl` record
+  is the exception: it holds to its own row and overflows — see below.
 - JSON is re-indented and syntax-coloured, preserving the file's key order, and
   folds a level at a time in the zoom — see below. A file too large to fetch
   whole won't parse, so it renders as plain text.

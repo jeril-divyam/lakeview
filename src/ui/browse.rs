@@ -849,74 +849,18 @@ fn tree_detail(app: &App, width: u16) -> Vec<Line<'static>> {
         return lines;
     }
 
-    // The commit the artifact ref names comes back with the preview, so it holds
-    // only while it still belongs to the object on screen — mid-debounce the
-    // selection has moved on and the ref it was browsed at is all there is.
-    let commit = app
-        .preview
-        .key
-        .as_ref()
-        .filter(|(_, _, path)| *path == node.stat.path)
-        .and(app.preview.commit.as_deref());
-    let reference = commit
-        .or_else(|| app.tree.key.as_ref().map(|(_, r)| r.as_str()))
-        .unwrap_or("");
-    lines.extend(object_details(&node.stat, reference, width));
-    lines.push(Line::raw(""));
+    // A file is its contents. What lakeFS knows about the object besides them —
+    // its size, its type, the commit behind it, where it sits in the store — is
+    // either on its row in the tree already or not what anyone opened the pane
+    // to read, so the preview has the whole of it.
     lines.extend(preview_lines(app, width));
     lines
 }
 
-/// The object's path and the ref it is being read at, in the shape an artifact
-/// API asks for it: rooted, and with the prefix a repository is partitioned by
-/// — `user/` or `system/` — left off, since a caller names a path inside one of
-/// those rather than the layout they sit in. Any other first segment is part of
-/// the path and is kept.
-fn artifact_ref(path: &str, reference: &str) -> String {
-    let rooted = ["user/", "system/"]
-        .iter()
-        .find_map(|prefix| path.strip_prefix(prefix))
-        .unwrap_or(path);
-    format!("/{}?ref={}", rooted.trim_start_matches('/'), reference)
-}
-
-fn object_details(
-    obj: &crate::lakefs::ObjectStats,
-    reference: &str,
-    width: u16,
-) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        kv(
-            "size",
-            &human_size(obj.size_bytes.unwrap_or(0)),
-            Theme::file(),
-        ),
-        kv("modified", &format_ts(obj.mtime), Theme::file()),
-    ];
-    if let Some(ct) = &obj.content_type
-        && !ct.is_empty()
-    {
-        lines.push(kv("type", ct, Theme::file()));
-    }
-    if !reference.is_empty() && !obj.path.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled("artifact ref", Theme::faint()));
-        // Full weight: this is the line you came here to read and copy, so it
-        // does not recede the way a stat's value does. The commit at the end of
-        // it is what identifies the version, so the pane wraps it rather than
-        // clipping it — one unbroken word, broken hard at the margin, with the
-        // label above standing in for a gutter.
-        lines.extend(wrap_line(
-            Line::styled(artifact_ref(&obj.path, reference), Theme::file()),
-            width as usize,
-            0,
-        ));
-    }
-    lines
-}
-
 fn preview_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::styled("─".repeat(width as usize), Theme::faint())];
+    // No rule at the top: it used to divide the object's details from its
+    // contents, and there are no details left above it to divide them from.
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
     if app.preview.loading {
         lines.push(Line::styled("loading preview…", Theme::dim()));
@@ -945,7 +889,14 @@ fn preview_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     row.iter()
                         .map(|(tok, text)| Span::styled(text.clone(), Theme::json(*tok))),
                 );
-                lines.push(Line::from(spans));
+                // A file is one value read top to bottom, so a long string in the
+                // middle of it is worth the lines it takes: cutting it at the
+                // edge hides the only part that says what the value is. The wrap
+                // hangs under the nesting, so the shape still reads down the pane
+                // and the numbered lines stay the file's own.
+                let line = Line::from(spans);
+                let indent = hanging_indent(&line);
+                lines.extend(wrap_line(line, width as usize, indent));
             }
         }
         Some(PreviewBody::Text(rows)) => {
@@ -1087,71 +1038,6 @@ mod tests {
     fn a_pane_too_narrow_to_wrap_is_left_alone() {
         let line = Line::from(vec![Span::raw(" 1 "), Span::raw("something long")]);
         assert_eq!(wrapped(line, 4).len(), 1);
-    }
-
-    #[test]
-    fn an_artifact_ref_is_rooted_at_the_path_inside_the_partition() {
-        assert_eq!(
-            artifact_ref("user/judges/bespoke/answer-accuracy.json", "main"),
-            "/judges/bespoke/answer-accuracy.json?ref=main"
-        );
-        assert_eq!(
-            artifact_ref("system/judges/a.json", "afa67f66"),
-            "/judges/a.json?ref=afa67f66"
-        );
-        // A repository that isn't partitioned keeps its whole path — the first
-        // segment is a directory like any other.
-        assert_eq!(
-            artifact_ref("judges/a.json", "main"),
-            "/judges/a.json?ref=main"
-        );
-        // Not every path that starts with those letters is one of them.
-        assert_eq!(
-            artifact_ref("users/a.json", "main"),
-            "/users/a.json?ref=main"
-        );
-    }
-
-    /// The side pane clips what it can't fit, and the commit at the end of an
-    /// artifact ref is what names the version, so it is wrapped instead — at
-    /// full weight, since it is the line the pane is there to show.
-    #[test]
-    fn an_artifact_ref_is_wrapped_rather_than_clipped() {
-        let obj = crate::lakefs::ObjectStats {
-            path: "user/judges/bespoke/answer-accuracy.json".into(),
-            path_type: "object".into(),
-            size_bytes: Some(56),
-            mtime: 0,
-            content_type: None,
-        };
-        let commit = "afa67f66".repeat(8);
-        let width = 28;
-
-        let lines = object_details(&obj, &commit, width);
-        let label = lines
-            .iter()
-            .position(|l| text(l) == "artifact ref")
-            .expect("the ref should be labelled");
-        let value = &lines[label + 1..];
-        assert!(value.len() > 1, "expected it to wrap: {value:?}");
-        assert_eq!(
-            value.iter().map(text).collect::<String>(),
-            format!("/judges/bespoke/answer-accuracy.json?ref={commit}"),
-            "every character of it should be on show"
-        );
-        for line in value {
-            let rendered = text(line);
-            assert!(
-                rendered.width() <= width as usize,
-                "{rendered:?} is wider than the pane"
-            );
-            // Full-weight text, not a stat's dimmed value.
-            assert_eq!(
-                line.style.fg,
-                Some(Theme::FG),
-                "the ref should not be dimmed: {rendered:?}"
-            );
-        }
     }
 
     // ── the zoomed JSONL view ────────────────────────────────────────────
@@ -1380,6 +1266,64 @@ mod tests {
         assert!(styles.contains(&Theme::json(JsonTok::Str)), "{styles:?}");
         // The gutter keeps its own faint style, ahead of the record's cells.
         assert_eq!(record.spans[0].style, Theme::faint());
+    }
+
+    /// A `.json` file is one value read top to bottom, so the side pane wraps it
+    /// rather than cutting a long string off at the edge. A `.jsonl` record
+    /// doesn't — see below.
+    #[tokio::test]
+    async fn the_side_pane_wraps_a_long_json_value() {
+        use crate::app::JsonTok;
+
+        let mut app = test_app();
+        let value = "v".repeat(120);
+        // The flat rendering the side pane reads, as the parser hands it over:
+        // the nesting is a span of its own, ahead of the key.
+        app.preview.body = Some(PreviewBody::Json {
+            lines: vec![
+                vec![(JsonTok::Punct, "{".into())],
+                vec![
+                    (JsonTok::Punct, "  ".into()),
+                    (JsonTok::Key, "\"k\"".into()),
+                    (JsonTok::Punct, ": ".into()),
+                    (JsonTok::Str, format!("\"{value}\"")),
+                ],
+                vec![(JsonTok::Punct, "}".into())],
+            ],
+            doc: crate::jsonl::JsonDoc::new(serde_json::Value::Null),
+        });
+
+        let width = 40;
+        let lines = preview_lines(&app, width);
+        for line in &lines {
+            assert!(
+                text(line).width() <= width as usize,
+                "{:?} overflows the pane",
+                text(line)
+            );
+        }
+        // Every character of the value is on show, over as many lines as it took.
+        // The indent each continuation hangs under is not part of it.
+        let whole: String = lines.iter().map(text).collect::<String>().replace(' ', "");
+        assert!(whole.contains(&value), "the value was cut: {whole:?}");
+        assert!(
+            lines.len() > 4,
+            "expected the value to wrap over several lines: {lines:?}"
+        );
+    }
+
+    /// A record is a row of its own here, and re-flowing one over ten lines
+    /// would bury the records under it. The zoom is where they open up.
+    #[tokio::test]
+    async fn the_side_pane_lets_a_long_jsonl_record_overflow() {
+        let mut app = test_app();
+        let record = format!(r#"{{"k":"{}"}}"#, "v".repeat(120));
+        app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(&record, false)));
+
+        let lines = preview_lines(&app, 40);
+        // One line for the record, however long it is.
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(text(&lines[0]).width() > 40);
     }
 
     /// A JSON file zoomed: the whole draw path, over the shape the zoom opens
