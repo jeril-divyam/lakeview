@@ -1,6 +1,6 @@
 //! Folding JSON documents, in the two shapes the preview meets them.
 //!
-//! [`JsonDoc`] is a whole file, opened one level down. [`Doc`] is newline-
+//! [`JsonDoc`] is a whole file, opened all the way down. [`Doc`] is newline-
 //! delimited records, each folded onto a row of its own. Both unfold a level at
 //! a time over the same [`Open`] tree and the same row vocabulary, and both are
 //! driven through [`Folding`], so the zoom's keys don't care which it has.
@@ -565,9 +565,9 @@ pub trait Folding {
 
 /// One JSON document, folded a level at a time.
 ///
-/// It opens one level down — the root's own members, with everything nested
-/// inside them folded onto a row each. A file's shape is the thing worth seeing
-/// first; the values under it are what you go looking for.
+/// It opens unfolded all the way down. A file is one value, and reading it is
+/// reading the whole of it — unlike JSONL, where the records repeat a shape and
+/// the top level is the thing worth seeing first. `c` folds it back up.
 ///
 /// The root brackets themselves don't fold. Collapsing a whole file to `{…}`
 /// says nothing, and `←` at that level is better spent leaving the zoom.
@@ -580,9 +580,10 @@ pub struct JsonDoc {
 
 impl JsonDoc {
     pub fn new(value: Value) -> Self {
+        let open = opened_to(&value, usize::MAX);
         Self {
             value,
-            open: Open::default(),
+            open,
             cursor: 0,
         }
     }
@@ -1401,6 +1402,14 @@ mod tests {
         JsonDoc::new(serde_json::from_str(text).unwrap())
     }
 
+    /// The same file shut back to its top level, which is where folding starts
+    /// from once you have collapsed what the zoom opened for you.
+    fn folded_json(text: &str) -> JsonDoc {
+        let mut doc = json(text);
+        doc.collapse_all();
+        doc
+    }
+
     fn json_rendered(doc: &JsonDoc) -> Vec<String> {
         doc.rows()
             .iter()
@@ -1408,11 +1417,33 @@ mod tests {
             .collect()
     }
 
-    /// What the zoom shows the moment it opens: the root's own members, with
-    /// everything nested under them folded onto a row each.
+    /// What the zoom shows the moment it opens: the whole file, every container
+    /// in it unfolded, however deep it goes.
     #[test]
-    fn a_json_file_opens_one_level_down() {
+    fn a_json_file_opens_all_of_itself_to_start_with() {
         let doc = json(r#"{"a":1,"b":{"c":2},"d":[1,2]}"#);
+        assert_eq!(
+            json_rendered(&doc),
+            [
+                "{",
+                "  \"a\": 1,",
+                "▾ \"b\": {",
+                "    \"c\": 2",
+                "  },",
+                "▾ \"d\": [",
+                "    1,",
+                "    2",
+                "  ]",
+                "}",
+            ]
+        );
+    }
+
+    /// Folded back up, the file reads as its top level: the root's own members,
+    /// with everything nested under them folded onto a row each.
+    #[test]
+    fn a_folded_json_file_reads_one_level_down() {
+        let doc = folded_json(r#"{"a":1,"b":{"c":2},"d":[1,2]}"#);
         assert_eq!(
             json_rendered(&doc),
             [
@@ -1427,7 +1458,7 @@ mod tests {
 
     #[test]
     fn unfolding_a_member_reveals_its_own_level_only() {
-        let mut doc = json(r#"{"a":{"b":{"c":1}}}"#);
+        let mut doc = folded_json(r#"{"a":{"b":{"c":1}}}"#);
         doc.toggle_row(1); // "a"
         assert_eq!(
             json_rendered(&doc),
@@ -1448,7 +1479,7 @@ mod tests {
 
     #[test]
     fn a_json_block_folds_from_its_closing_bracket_too() {
-        let mut doc = json(r#"{"a":{"b":1}}"#);
+        let mut doc = folded_json(r#"{"a":{"b":1}}"#);
         doc.toggle_row(1); // unfold "a"
         assert_eq!(doc.rows_len(), 5);
         doc.toggle_row(3); // the `}` closing "a"
@@ -1458,7 +1489,7 @@ mod tests {
 
     #[test]
     fn folding_a_json_block_again_keeps_what_was_open_inside() {
-        let mut doc = json(r#"{"a":{"b":{"c":1}}}"#);
+        let mut doc = folded_json(r#"{"a":{"b":{"c":1}}}"#);
         doc.toggle_row(1);
         doc.toggle_row(2);
         let deep = doc.rows_len();
@@ -1472,7 +1503,7 @@ mod tests {
     /// `←` unwinds a level per press, and only gives way at the document's level.
     #[test]
     fn json_back_folds_its_way_out_before_giving_way() {
-        let mut doc = json(r#"{"a":{"b":{"c":1}}}"#);
+        let mut doc = folded_json(r#"{"a":{"b":{"c":1}}}"#);
         doc.toggle_row(1); // unfold "a"
         doc.toggle_row(2); // unfold "b"
 
@@ -1495,7 +1526,7 @@ mod tests {
 
     #[test]
     fn json_back_steps_out_of_a_folded_sibling_rather_than_opening_it() {
-        let mut doc = json(r#"{"a":{"b":{"c":1}}}"#);
+        let mut doc = folded_json(r#"{"a":{"b":{"c":1}}}"#);
         doc.toggle_row(1); // unfold "a"; row 2 is the folded "b"
         let before = doc.rows_len();
         doc.cursor = 2;
@@ -1515,7 +1546,7 @@ mod tests {
 
     #[test]
     fn an_array_root_opens_the_same_way() {
-        let doc = json(r#"[1,{"a":2}]"#);
+        let doc = folded_json(r#"[1,{"a":2}]"#);
         assert_eq!(
             json_rendered(&doc),
             ["[", "  1,", "▸ {\"a\": 2}", "]"]
@@ -1537,7 +1568,7 @@ mod tests {
     /// Folding above the cursor can shorten the document under it.
     #[test]
     fn folding_pulls_the_json_cursor_back_into_range() {
-        let mut doc = json(r#"{"a":{"b":1,"c":2,"d":3}}"#);
+        let mut doc = folded_json(r#"{"a":{"b":1,"c":2,"d":3}}"#);
         doc.toggle_row(1);
         doc.cursor = doc.rows_len() - 1;
         doc.toggle_row(1);
@@ -1820,8 +1851,8 @@ mod tests {
     /// all of it wherever the cursor happens to be.
     #[test]
     fn a_json_file_opens_all_of_itself() {
-        let mut doc = json(r#"{"a":{"b":{"c":1}},"d":{"e":2}}"#);
-        assert_eq!(json_depth(&doc), 1, "it opens one level down");
+        let mut doc = folded_json(r#"{"a":{"b":{"c":1}},"d":{"e":2}}"#);
+        assert_eq!(json_depth(&doc), 1, "folded up, it reads one level down");
 
         assert_eq!(doc.expand_all(), None);
         assert_eq!(

@@ -1266,9 +1266,9 @@ mod tests {
     }
 
     /// A JSON file zoomed: the whole draw path, over the shape the zoom opens
-    /// with — the root's members, everything under them folded.
+    /// with — the file unfolded all the way down.
     #[tokio::test]
-    async fn a_zoomed_json_file_draws_one_level_open() {
+    async fn a_zoomed_json_file_draws_fully_open() {
         let mut app = test_app();
         let value: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":{"c":2}}"#).unwrap();
         app.preview.body = Some(PreviewBody::Json {
@@ -1281,27 +1281,28 @@ mod tests {
 
         let all = render(&mut app, 60, 12).join("\n");
         assert!(all.contains("\"a\": 1,"), "{all}");
-        // "b" is a container, so it stays folded onto a row behind its marker.
-        assert!(all.contains(r#"▸ "b": {"c": 2}"#), "{all}");
-        assert!(all.contains(" zoom "), "{all}");
-
-        // `→` on that row unfolds it, to its own level and no further.
-        app.move_selection(2);
-        app.open();
-        let all = render(&mut app, 60, 12).join("\n");
+        // "b" is a container, and it opens with the rest of the file.
         assert!(all.contains(r#"▾ "b": {"#), "{all}");
         assert!(all.contains("\"c\": 2"), "{all}");
+        assert!(all.contains(" zoom "), "{all}");
 
-        // And `→` again leaves it open: descending is one direction.
+        // `→` on an open row leaves it open: descending is one direction.
+        app.move_selection(2);
         app.open();
         let again = render(&mut app, 60, 12).join("\n");
         assert_eq!(again, all, "`→` on an open row folded it");
 
-        // `←` folds it straight back up.
+        // `←` folds it back onto its own row.
         app.back();
         let all = render(&mut app, 60, 12).join("\n");
         assert!(all.contains(r#"▸ "b": {"c": 2}"#), "{all}");
         assert_eq!(app.mode, Mode::Zoom, "folding is not leaving");
+
+        // And `→` opens it again, to its own level.
+        app.open();
+        let all = render(&mut app, 60, 12).join("\n");
+        assert!(all.contains(r#"▾ "b": {"#), "{all}");
+        assert!(all.contains("\"c\": 2"), "{all}");
     }
 
     /// Drives the real draw path — pane frame, layout, clipping and all — over

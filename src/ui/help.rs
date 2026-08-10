@@ -39,9 +39,9 @@ and ← move focus instead. / in the tree searches recursively, \
 walking into closed directories and opening the path to every match; Esc restores the shape \
 you had open. Set ui.mouse = false to hand the mouse back to your terminal.";
 
-const FOLDING: &str = "A zoomed .json opens one level down: the root's own members, with every \
-object and array inside them folded onto a row each. A zoomed .jsonl folds one step further, \
-listing its records a row apiece. →, Enter or space unfolds the selected row a level at a time; \
+const FOLDING: &str = "A zoomed .json opens unfolded all the way down, the whole file on show. A \
+zoomed .jsonl starts folded instead, listing its records a row apiece. \
+→, Enter or space unfolds the selected row a level at a time; \
 space folds it back up too, from its opening row or its closing bracket either way. ← winds back out, \
 folding what is open and stepping out of what is not, and leaves the zoom only once nothing is \
 left to close; Esc leaves at once. Folded rows are truncated — unfolding is how you see the rest \

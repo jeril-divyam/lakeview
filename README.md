@@ -151,10 +151,10 @@ thing, so a directory says so rather than quietly doing nothing.
 
 ## JSON
 
-Zooming a `.json` file (`→` on it in the tree) opens it one level down: the
-root's own members, with every object and array inside them folded onto a row
-each and marked `▸`. A file's shape is the thing worth seeing first; the values
-under it are what you go looking for.
+Zooming a `.json` file (`→` on it in the tree) opens it unfolded all the way
+down: every object and array inside it on show, marked `▾`. A file is one value,
+and reading it is reading the whole of it — `c` folds it back to the root's own
+members when the shape is what you are after.
 
 ```
 ╭ daily_rollup.json ─────────────────────────── zoom  ╮
@@ -162,13 +162,18 @@ under it are what you go looking for.
 │  1 {                                                │
 │  2   "name": "daily_rollup",                        │
 │  3   "clicks": 2,                                   │
-│  4 ▸ "tags": ["a", "b"],                            │
-│  5 ▾ "meta": {                                      │
-│  6     "pid": 11,                                   │
-│  7   ▸ "nested": {"deep": true}                     │
-│  8   },                                             │
-│  9   "ok": null                                     │
-│ 10 }                                                │
+│  4 ▾ "tags": [                                      │
+│  5     "a",                                         │
+│  6     "b"                                          │
+│  7   ],                                             │
+│  8 ▾ "meta": {                                      │
+│  9     "pid": 11,                                   │
+│ 10   ▾ "nested": {                                  │
+│ 11       "deep": true                               │
+│ 12     }                                            │
+│ 13   },                                             │
+│ 14   "ok": null                                     │
+│ 15 }                                                │
 ╰─────────────────────────────────────────────────────╯
 ```
 
@@ -233,13 +238,13 @@ than "at least level 2". The footer names the level it settled on, since a row
 folded at level 2 looks no different from one folded at level 5.
 
 `c` folds everything back up, however deep any of it was open, and forgets what
-was open inside — unlike `←` and `space`, which remember. It is the state the file
-was zoomed in at.
+was open inside — unlike `←` and `space`, which remember. In a `.jsonl` it is the
+state the file was zoomed in at.
 
 In a zoomed `.json` the two are simpler: the file is one value rather than a shape
 repeated, so there is nothing to level it against. `a` opens the whole of it
-wherever the cursor sits, and `c` shuts it back to level 1 — the root's own
-members, since the root brackets don't fold.
+wherever the cursor sits — which is how it was zoomed in — and `c` shuts it back
+to level 1, the root's own members, since the root brackets don't fold.
 
 A folded row is truncated rather than wrapped — unfolding it is how you see the
 rest, and re-flowing one record over ten lines would bury the records under it.
