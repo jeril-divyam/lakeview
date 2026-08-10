@@ -429,3 +429,7 @@ the footer and leaves the file alone rather than guessing.
   keys you don't want to read — see below.
 - Everything is read-only — lakeview never writes to your lakeFS server. `d` is
   the only thing it writes anywhere, and only to the working directory.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
