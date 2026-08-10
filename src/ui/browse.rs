@@ -849,13 +849,42 @@ fn tree_detail(app: &App, width: u16) -> Vec<Line<'static>> {
         return lines;
     }
 
-    lines.extend(object_details(&node.stat, width));
+    // The commit the artifact ref names comes back with the preview, so it holds
+    // only while it still belongs to the object on screen — mid-debounce the
+    // selection has moved on and the ref it was browsed at is all there is.
+    let commit = app
+        .preview
+        .key
+        .as_ref()
+        .filter(|(_, _, path)| *path == node.stat.path)
+        .and(app.preview.commit.as_deref());
+    let reference = commit
+        .or_else(|| app.tree.key.as_ref().map(|(_, r)| r.as_str()))
+        .unwrap_or("");
+    lines.extend(object_details(&node.stat, reference, width));
     lines.push(Line::raw(""));
     lines.extend(preview_lines(app, width));
     lines
 }
 
-fn object_details(obj: &crate::lakefs::ObjectStats, width: u16) -> Vec<Line<'static>> {
+/// The object's path and the ref it is being read at, in the shape an artifact
+/// API asks for it: rooted, and with the prefix a repository is partitioned by
+/// — `user/` or `system/` — left off, since a caller names a path inside one of
+/// those rather than the layout they sit in. Any other first segment is part of
+/// the path and is kept.
+fn artifact_ref(path: &str, reference: &str) -> String {
+    let rooted = ["user/", "system/"]
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix))
+        .unwrap_or(path);
+    format!("/{}?ref={}", rooted.trim_start_matches('/'), reference)
+}
+
+fn object_details(
+    obj: &crate::lakefs::ObjectStats,
+    reference: &str,
+    width: u16,
+) -> Vec<Line<'static>> {
     let mut lines = vec![
         kv(
             "size",
@@ -869,18 +898,16 @@ fn object_details(obj: &crate::lakefs::ObjectStats, width: u16) -> Vec<Line<'sta
     {
         lines.push(kv("type", ct, Theme::file()));
     }
-    if !obj.checksum.is_empty() {
-        lines.push(kv("checksum", &truncate(&obj.checksum, 32), Theme::dim()));
-    }
-    if !obj.physical_address.is_empty() {
+    if !reference.is_empty() && !obj.path.is_empty() {
         lines.push(Line::raw(""));
-        lines.push(Line::styled("physical address", Theme::faint()));
-        // The part that identifies the object is at the end of it, so clipping
-        // this at the pane's edge would keep the half worth nothing. It is one
-        // unbroken word, so it breaks hard at the margin; the label above it
-        // stands in for a gutter, and the continuations start at it.
+        lines.push(Line::styled("artifact ref", Theme::faint()));
+        // Full weight: this is the line you came here to read and copy, so it
+        // does not recede the way a stat's value does. The commit at the end of
+        // it is what identifies the version, so the pane wraps it rather than
+        // clipping it — one unbroken word, broken hard at the margin, with the
+        // label above standing in for a gutter.
         lines.extend(wrap_line(
-            Line::styled(obj.physical_address.clone(), Theme::dim()),
+            Line::styled(artifact_ref(&obj.path, reference), Theme::file()),
             width as usize,
             0,
         ));
@@ -1062,38 +1089,67 @@ mod tests {
         assert_eq!(wrapped(line, 4).len(), 1);
     }
 
-    /// The side pane clips what it can't fit, and the end of a physical address
-    /// is the part that names the object, so it is wrapped before it gets there.
     #[test]
-    fn a_physical_address_is_wrapped_rather_than_clipped() {
+    fn an_artifact_ref_is_rooted_at_the_path_inside_the_partition() {
+        assert_eq!(
+            artifact_ref("user/judges/bespoke/answer-accuracy.json", "main"),
+            "/judges/bespoke/answer-accuracy.json?ref=main"
+        );
+        assert_eq!(
+            artifact_ref("system/judges/a.json", "afa67f66"),
+            "/judges/a.json?ref=afa67f66"
+        );
+        // A repository that isn't partitioned keeps its whole path — the first
+        // segment is a directory like any other.
+        assert_eq!(
+            artifact_ref("judges/a.json", "main"),
+            "/judges/a.json?ref=main"
+        );
+        // Not every path that starts with those letters is one of them.
+        assert_eq!(
+            artifact_ref("users/a.json", "main"),
+            "/users/a.json?ref=main"
+        );
+    }
+
+    /// The side pane clips what it can't fit, and the commit at the end of an
+    /// artifact ref is what names the version, so it is wrapped instead — at
+    /// full weight, since it is the line the pane is there to show.
+    #[test]
+    fn an_artifact_ref_is_wrapped_rather_than_clipped() {
         let obj = crate::lakefs::ObjectStats {
-            path: "data/curated/daily_rollup.json".into(),
+            path: "user/judges/bespoke/answer-accuracy.json".into(),
             path_type: "object".into(),
-            physical_address: format!("s3://bucket/lakefs/data/{}", "g".repeat(60)),
-            checksum: String::new(),
             size_bytes: Some(56),
             mtime: 0,
             content_type: None,
         };
+        let commit = "afa67f66".repeat(8);
         let width = 28;
 
-        let lines = object_details(&obj, width);
+        let lines = object_details(&obj, &commit, width);
         let label = lines
             .iter()
-            .position(|l| text(l) == "physical address")
-            .expect("the address should be labelled");
-        let address = &lines[label + 1..];
-        assert!(address.len() > 1, "expected it to wrap: {address:?}");
+            .position(|l| text(l) == "artifact ref")
+            .expect("the ref should be labelled");
+        let value = &lines[label + 1..];
+        assert!(value.len() > 1, "expected it to wrap: {value:?}");
         assert_eq!(
-            address.iter().map(text).collect::<String>(),
-            obj.physical_address,
+            value.iter().map(text).collect::<String>(),
+            format!("/judges/bespoke/answer-accuracy.json?ref={commit}"),
             "every character of it should be on show"
         );
-        for line in address {
+        for line in value {
             let rendered = text(line);
             assert!(
                 rendered.width() <= width as usize,
                 "{rendered:?} is wider than the pane"
+            );
+            // Full-weight text, not a stat's dimmed value.
+            assert_eq!(
+                line.style.fg,
+                Some(Theme::FG),
+                "the ref should not be dimmed: {rendered:?}"
             );
         }
     }

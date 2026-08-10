@@ -338,6 +338,15 @@ selection, set `mouse = false` under `[ui]` and everything stays keyboard-driven
 
 - Listings are paginated transparently and sorted directories-first.
 - Directories are fetched one level at a time, as you open them.
+- A selected file's details name its `artifact ref` — its path, and the commit
+  that last changed it, as
+  `/judges/bespoke/answer-accuracy.json?ref=afa67f66…`. A leading `user/` or
+  `system/` is left off, since those partition a repository rather than being
+  part of the path inside one; any other first segment is kept. The commit is
+  found by the log of one object, fetched alongside the preview, so it names the
+  version you are actually looking at rather than wherever the branch has since
+  moved to. Until it lands — or if the object has no commit behind it yet — the
+  ref you are browsing stands in.
 - Text previews are capped at `preview_bytes`; binary content falls back to a
   hex dump.
 - The zoomed preview wraps long lines, hanging continuations under the content

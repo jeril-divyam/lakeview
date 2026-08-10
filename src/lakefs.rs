@@ -70,10 +70,6 @@ pub struct ObjectStats {
     pub path: String,
     pub path_type: String,
     #[serde(default)]
-    pub physical_address: String,
-    #[serde(default)]
-    pub checksum: String,
-    #[serde(default)]
     pub size_bytes: Option<u64>,
     #[serde(default)]
     pub mtime: i64,
@@ -431,6 +427,40 @@ impl Client {
         Ok(written)
     }
 
+    /// The commit that last changed `path`, which is the log of `reference`
+    /// filtered to that one object and stopped at its first entry.
+    ///
+    /// `None` when nothing is found: an object staged on a branch and not yet
+    /// committed has no commit to name, and neither does a server that doesn't
+    /// take the filter — in both cases the ref the caller already has is the
+    /// most it can say.
+    pub async fn last_commit(
+        &self,
+        repo: &str,
+        reference: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        let what = "finding the commit that last changed the object";
+        let resp = self
+            .get(&format!(
+                "/repositories/{}/refs/{}/commits",
+                enc(repo),
+                enc(reference)
+            ))
+            // `limit` keeps lakeFS from walking the whole history to fill the
+            // page once it has the one entry we asked for.
+            .query(&[("objects", path), ("amount", "1"), ("limit", "true")])
+            .send()
+            .await
+            .with_context(|| what.to_string())?;
+        let resp = Self::check(resp, what).await?;
+        let page: Page<Commit> = resp
+            .json()
+            .await
+            .with_context(|| format!("{what}: unexpected response body"))?;
+        Ok(page.results.into_iter().next().map(|c| c.id))
+    }
+
     pub async fn commits(&self, repo: &str, reference: &str) -> Result<Vec<Commit>> {
         self.paged(
             &format!(
@@ -581,6 +611,46 @@ mod tests {
             head.contains("authorization:") || head.contains("Authorization:"),
             "{head}"
         );
+    }
+
+    /// The object's own commit is the log filtered to that one path, asked for
+    /// one entry at a time and stopped there.
+    #[tokio::test]
+    async fn the_last_commit_asks_the_log_for_one_object() {
+        let body = r#"{"results":[{"id":"afa67f6601241a0a","parents":[],"committer":"eart",
+            "message":"seed judges","creation_date":1,"meta_range_id":""}],
+            "pagination":{"has_more":false,"next_offset":"","max_per_page":1,"results":1}}"#;
+        let (endpoint, request) = serve_once(body.into()).await;
+        let client = Client::new(&profile(endpoint), 500).unwrap();
+
+        let path = "user/judges/bespoke/answer-accuracy.json";
+        let commit = client
+            .last_commit("evalm8-acme", "main", path)
+            .await
+            .unwrap();
+        assert_eq!(commit.as_deref(), Some("afa67f6601241a0a"));
+
+        let head = request.await.unwrap();
+        assert!(head.contains("/refs/main/commits"), "{head}");
+        assert!(
+            head.contains("objects=user%2Fjudges%2Fbespoke%2Fanswer-accuracy.json"),
+            "the path filters the log: {head}"
+        );
+        assert!(head.contains("amount=1"), "{head}");
+        assert!(head.contains("limit=true"), "{head}");
+    }
+
+    /// An object with no commit behind it — staged on a branch, say — leaves the
+    /// caller with the ref it already had rather than an error.
+    #[tokio::test]
+    async fn an_object_with_no_commit_yet_names_none() {
+        let body = r#"{"results":[],"pagination":{"has_more":false,"next_offset":"",
+            "max_per_page":1,"results":0}}"#;
+        let (endpoint, _request) = serve_once(body.into()).await;
+        let client = Client::new(&profile(endpoint), 500).unwrap();
+
+        let commit = client.last_commit("repo", "main", "staged.json").await;
+        assert_eq!(commit.unwrap(), None);
     }
 
     /// A failed download reports the server's own message rather than writing a
