@@ -58,6 +58,7 @@ const MOUSE: &[(&str, &str)] = &[
     ("double-click", "expand / collapse, or open"),
     ("right-click", "collapse / go back"),
     ("wheel", "scroll under the cursor"),
+    ("drag a border", "resize the panes either side"),
 ];
 
 const CONFIG: &str = "Profiles live in ~/.config/lakeview.toml. Each sets endpoint, access_key_id and \

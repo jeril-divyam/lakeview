@@ -12,15 +12,17 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use super::{format_ts, human_size, justify, truncate};
-use crate::app::{App, Focus, Load, PreviewBody, ReposRow, ReposView, RowKind, TreeView};
+use crate::app::{
+    App, Divider, Focus, Handle, Load, PreviewBody, ReposRow, ReposView, RowKind, TreeView,
+};
 use crate::jsonl::{DocRow, Row as JsonRow};
 use crate::theme::Theme;
 
 /// Floors the configured widths are held to, so no ratio can squeeze a pane
 /// down to nothing. The preview drops out before the tree reaches its floor.
-const MIN_REPOS: u16 = 12;
-const MIN_TREE: u16 = 24;
-const MIN_PREVIEW: u16 = 20;
+pub(crate) const MIN_REPOS: u16 = 12;
+pub(crate) const MIN_TREE: u16 = 24;
+pub(crate) const MIN_PREVIEW: u16 = 20;
 /// Room a tree row keeps for its name however deep it sits.
 const MIN_NAME: usize = 10;
 
@@ -30,6 +32,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     app.hits.preview = None;
     app.hits.preview_rows.clear();
     app.hits.commits = None;
+    app.hits.dividers.clear();
 
     // The key menu is a panel over the zoom rather than a place of its own, so
     // the zoom is still what is drawn under it.
@@ -69,6 +72,38 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     constraints.push(Constraint::Fill(1));
     let chunks = Layout::horizontal(constraints).split(area);
 
+    // Where two panes meet, so a press on the border can move it. A divider is
+    // those two adjacent border columns and nothing wider — the column beside them
+    // is a list's selection marker, and a handle that swallowed it would eat clicks
+    // meant for a row. The tree's border stays a handle with the preview closed,
+    // since dragging it back off the edge is what reopens it.
+    let tree_slot = chunks[if show_repos { 1 } else { 0 }];
+    if show_repos {
+        app.hits.dividers.push(Handle {
+            which: Divider::Repos,
+            area: Rect::new(chunks[0].right().saturating_sub(1), area.y, 2, area.height),
+            start: area.x,
+            room: area.width,
+        });
+    }
+    // The same expression either way: with the preview showing the tree starts
+    // after the repositories pane, and with it closed the tree is the `Fill(1)`
+    // last chunk, so this is the columns the two have to divide in both cases.
+    let room = area.right().saturating_sub(tree_slot.x);
+    if show_preview || room >= MIN_TREE + MIN_PREVIEW {
+        app.hits.dividers.push(Handle {
+            which: Divider::Tree,
+            area: Rect::new(
+                tree_slot.right().saturating_sub(1),
+                area.y,
+                if show_preview { 2 } else { 1 },
+                area.height,
+            ),
+            start: tree_slot.x,
+            room,
+        });
+    }
+
     let mut next = 0;
     if show_repos {
         let slot = chunks[next];
@@ -94,6 +129,16 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 
     if show_preview {
         app.hits.preview = Some(draw_detail(frame, app, chunks[next], false));
+    }
+
+    // The border being dragged wears the accent, so which one the pointer took
+    // hold of is never in doubt. Painted over the panes rather than through their
+    // border styles: a divider is two panes' borders side by side, and colouring
+    // it that way would mean telling both of them about a drag.
+    if let Some(which) = app.dragging()
+        && let Some(handle) = app.hits.dividers.iter().find(|h| h.which == which)
+    {
+        frame.buffer_mut().set_style(handle.area, Theme::accent());
     }
 }
 
@@ -1978,5 +2023,285 @@ mod tests {
         app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse("1\n2\n", false)));
         app.open_keys();
         assert_eq!(app.mode, Mode::Zoom);
+    }
+
+    // ── resizing the panes by their borders ──────────────────────────────
+    //
+    // `render` draws into the whole area, so the body starts at column 0 and the
+    // numbers below are the layout's own. At width 120 with the defaults the panes
+    // are [0,28) [28,74) [74,120), which puts the borders at columns 27-28 and
+    // 73-74.
+
+    fn handle(app: &App, which: Divider) -> Handle {
+        *app.hits
+            .dividers
+            .iter()
+            .find(|h| h.which == which)
+            .unwrap_or_else(|| panic!("{which:?} is not a border in this layout"))
+    }
+
+    /// Press a border, drag it to `to`, let go, and draw the frame the drag is
+    /// judged by. `grab` picks which of the border's columns the press lands on.
+    fn drag(app: &mut App, which: Divider, grab: u16, to: u16, width: u16) {
+        let area = handle(app, which).area;
+        assert!(
+            app.drag_start(area.x + grab, area.y),
+            "no border at {}",
+            area.x + grab
+        );
+        app.drag_move(to);
+        app.drag_end();
+        render(app, width, 24);
+    }
+
+    /// Where a border sits, as its leftmost column.
+    fn border(app: &App, which: Divider) -> u16 {
+        handle(app, which).area.x
+    }
+
+    #[tokio::test]
+    async fn a_ratio_pair_is_honoured_to_the_column() {
+        // Written as literal column counts summing to the room the two panes
+        // divide, the ratios reproduce that split exactly rather than nearly.
+        let mut app = test_app();
+        app.cfg.ui.tree_ratio = 60;
+        app.cfg.ui.preview_ratio = 32;
+        render(&mut app, 120, 24);
+        assert_eq!(border(&app, Divider::Tree), 28 + 60 - 1);
+    }
+
+    #[tokio::test]
+    async fn the_ratio_pair_scales_with_the_terminal() {
+        let mut app = test_app();
+        app.cfg.ui.tree_ratio = 60;
+        app.cfg.ui.preview_ratio = 32;
+        // 138 columns to divide instead of 92, in the same proportion.
+        render(&mut app, 166, 24);
+        assert_eq!(border(&app, Divider::Tree), 28 + 90 - 1);
+    }
+
+    #[tokio::test]
+    async fn a_narrow_terminal_drops_the_preview_then_the_repositories() {
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        assert!(app.hits.repos.is_some() && app.hits.preview.is_some());
+
+        render(&mut app, 50, 24);
+        assert!(app.hits.repos.is_some(), "the repositories pane went first");
+        assert!(app.hits.preview.is_none(), "the preview should have dropped");
+
+        render(&mut app, 30, 24);
+        assert!(app.hits.repos.is_none());
+        assert!(app.hits.tree.is_some(), "the focused pane keeps the width");
+    }
+
+    #[tokio::test]
+    async fn the_panes_never_go_below_their_floors() {
+        let mut app = test_app();
+        app.cfg.ui.repos_width = 500;
+        render(&mut app, 120, 24);
+        // Hits are inner rects, so the pane itself is two columns wider.
+        assert!(app.hits.tree.unwrap().width + 2 >= MIN_TREE);
+        assert!(app.hits.repos.unwrap().width + 2 >= MIN_REPOS);
+    }
+
+    #[tokio::test]
+    async fn both_borders_are_handles_when_all_three_panes_show() {
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        assert_eq!(app.hits.dividers.len(), 2);
+        // Two columns each: the left pane's right border and the right pane's left.
+        assert_eq!(handle(&app, Divider::Repos).area.width, 2);
+        assert_eq!(handle(&app, Divider::Tree).area.width, 2);
+        assert_eq!(border(&app, Divider::Repos), 27);
+        assert_eq!(border(&app, Divider::Tree), 73);
+    }
+
+    #[tokio::test]
+    async fn a_closed_preview_leaves_the_trees_border_as_the_handle() {
+        let mut app = test_app();
+        app.cfg.ui.preview_ratio = 0;
+        render(&mut app, 120, 24);
+        assert!(app.hits.preview.is_none());
+        // One column, at the body's last: there is no pane to its right to
+        // contribute a second. Dragging it back off the edge is what reopens.
+        let h = handle(&app, Divider::Tree);
+        assert_eq!((h.area.x, h.area.width), (119, 1));
+        assert_eq!((h.start, h.room), (28, 92));
+    }
+
+    #[tokio::test]
+    async fn a_zoom_and_the_commits_tab_have_no_handles() {
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        assert_eq!(app.hits.dividers.len(), 2);
+
+        app.mode = Mode::Zoom;
+        render(&mut app, 120, 24);
+        assert!(app.hits.dividers.is_empty(), "a zoom has no panes to divide");
+
+        app.mode = Mode::Normal;
+        app.tab = crate::app::Tab::Commits;
+        framed(&mut app, 120, 24);
+        assert!(app.hits.dividers.is_empty());
+        assert!(!app.drag_start(27, 5), "a border was grabbed off the browser");
+    }
+
+    #[tokio::test]
+    async fn a_press_on_a_border_is_not_a_click() {
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        let focus = app.focus;
+
+        assert!(app.drag_start(27, 5), "the border did not take the press");
+        assert_eq!(app.focus, focus, "a border grab moved the focus");
+        assert!(app.dragging().is_some());
+
+        // And a press that missed goes on to mean what it usually does.
+        app.drag_end();
+        assert!(!app.drag_start(40, 5), "a row was taken for a border");
+    }
+
+    #[tokio::test]
+    async fn grabbing_a_border_by_either_column_leaves_it_where_it_was() {
+        // The press remembers where in the border it landed, so the border tracks
+        // the pointer rather than jumping a column under it.
+        for grab in [0, 1] {
+            let mut app = test_app();
+            render(&mut app, 120, 24);
+            let at = border(&app, Divider::Repos);
+            drag(&mut app, Divider::Repos, grab, at + grab, 120);
+            assert_eq!(border(&app, Divider::Repos), at, "grabbed at {grab}");
+            assert_eq!(app.cfg.ui.repos_width, 28);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_border_follows_the_pointer_column_for_column() {
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        drag(&mut app, Divider::Repos, 0, 37, 120);
+        assert_eq!(app.cfg.ui.repos_width, 38);
+        assert_eq!(border(&app, Divider::Repos), 37);
+    }
+
+    #[tokio::test]
+    async fn a_dragged_border_stays_where_it_was_dropped() {
+        // The round trip: what a drag writes, the next layout reproduces.
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        drag(&mut app, Divider::Tree, 0, 60, 120);
+        assert_eq!(border(&app, Divider::Tree), 60);
+        // And again from the layout it landed on.
+        drag(&mut app, Divider::Tree, 0, 84, 120);
+        assert_eq!(border(&app, Divider::Tree), 84);
+    }
+
+    #[tokio::test]
+    async fn dragging_the_first_border_moves_only_the_first_border() {
+        // The ratios split what the first border leaves over, not the screen, so
+        // without pinning the preview's width this would slide the second border
+        // too — one gesture moving two things.
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        let tree_border = border(&app, Divider::Tree);
+
+        drag(&mut app, Divider::Repos, 0, 37, 120);
+        assert_eq!(border(&app, Divider::Repos), 37, "the grabbed border");
+        assert_eq!(border(&app, Divider::Tree), tree_border, "the other one moved");
+    }
+
+    #[tokio::test]
+    async fn a_drag_past_the_floor_stops_at_it() {
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        drag(&mut app, Divider::Repos, 0, 0, 120);
+        assert_eq!(app.cfg.ui.repos_width, MIN_REPOS);
+
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        drag(&mut app, Divider::Tree, 0, 28, 120);
+        assert_eq!(app.cfg.ui.tree_ratio, MIN_TREE);
+        assert!(app.hits.preview.is_some(), "the preview is still drawn");
+    }
+
+    #[tokio::test]
+    async fn the_first_border_stops_before_it_would_crush_the_preview() {
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        drag(&mut app, Divider::Repos, 0, 119, 120);
+        assert_eq!(app.cfg.ui.repos_width, 120 - MIN_TREE - MIN_PREVIEW);
+        assert!(
+            app.hits.preview.is_some(),
+            "the first border closed the preview by the back door"
+        );
+    }
+
+    #[tokio::test]
+    async fn overshooting_the_second_border_does_not_close_the_preview() {
+        // Its floor parks it twenty columns short of the edge, and crossing those
+        // columns moves nothing — only arriving at the edge itself commits.
+        for to in [100, 114] {
+            let mut app = test_app();
+            render(&mut app, 120, 24);
+            drag(&mut app, Divider::Tree, 0, to, 120);
+            assert!(app.hits.preview.is_some(), "closed by a drag to {to}");
+            assert_eq!(app.cfg.ui.preview_ratio, MIN_PREVIEW);
+        }
+    }
+
+    #[tokio::test]
+    async fn shoving_the_second_border_off_the_edge_closes_the_preview() {
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        drag(&mut app, Divider::Tree, 0, 119, 120);
+        assert_eq!(app.cfg.ui.preview_ratio, 0, "the config's own hide value");
+        assert!(app.hits.preview.is_none());
+        // The tree took the columns the preview gave up.
+        assert_eq!(app.hits.tree.unwrap().width + 2, 92);
+    }
+
+    #[tokio::test]
+    async fn a_closed_preview_stays_closed_until_a_whole_one_fits() {
+        let mut app = test_app();
+        app.cfg.ui.preview_ratio = 0;
+        render(&mut app, 120, 24);
+
+        // A few columns back off the edge is not room for a preview.
+        drag(&mut app, Divider::Tree, 0, 114, 120);
+        assert!(app.hits.preview.is_none(), "snapped open at its floor");
+
+        // Far enough back, and it returns.
+        drag(&mut app, Divider::Tree, 0, 90, 120);
+        assert!(app.hits.preview.is_some());
+        assert!(app.cfg.ui.preview_ratio >= MIN_PREVIEW);
+    }
+
+    #[tokio::test]
+    async fn a_drag_is_dropped_when_the_panes_go() {
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        assert!(app.drag_start(27, 5));
+
+        // The zoom takes the whole body, so the border is no longer on screen.
+        app.mode = Mode::Zoom;
+        render(&mut app, 120, 24);
+        app.drag_move(60);
+
+        assert!(app.dragging().is_none(), "the drag outlived its border");
+        assert_eq!(app.cfg.ui.repos_width, 28, "a border that is gone moved");
+    }
+
+    #[tokio::test]
+    async fn the_held_border_wears_the_accent() {
+        let mut app = test_app();
+        let buffer = framed(&mut app, 120, 24);
+        let area = handle(&app, Divider::Repos).area;
+        assert_ne!(buffer[(area.x, area.y + 4)].fg, Theme::ACCENT);
+
+        assert!(app.drag_start(area.x, area.y + 4));
+        let buffer = framed(&mut app, 120, 24);
+        assert_eq!(buffer[(area.x, area.y + 4)].fg, Theme::ACCENT);
+        assert_eq!(buffer[(area.x + 1, area.y + 4)].fg, Theme::ACCENT);
     }
 }

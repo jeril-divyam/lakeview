@@ -39,6 +39,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     app.hits.repos = None;
     app.hits.tree = None;
     app.hits.preview = None;
+    app.hits.dividers.clear();
 
     match &app.commits.load {
         // `Idle` never reaches here — the commits view uses `None` for that.

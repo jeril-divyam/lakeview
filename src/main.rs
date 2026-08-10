@@ -188,6 +188,10 @@ fn on_key(app: &mut App, key: KeyEvent) {
     if key.kind != KeyEventKind::Press {
         return;
     }
+    // A keypress is proof the mouse has moved on. The widths are already live, so
+    // ending the gesture here commits it rather than abandoning it — and a drag
+    // whose button-up never arrived doesn't outlive the drag.
+    app.drag_end();
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl && matches!(key.code, KeyCode::Char('c')) {
         app.should_quit = true;
@@ -231,8 +235,22 @@ fn on_mouse(app: &mut App, mouse: MouseEvent) {
         // Overlays are keyboard-driven; a click elsewhere just dismisses them.
         MouseEventKind::Down(MouseButton::Left) => match app.mode {
             Mode::Profiles(_) | Mode::Filter => app.mode = Mode::Normal,
-            Mode::Keys | Mode::Zoom | Mode::Normal => app.mouse_click(col, row),
+            // A press on a pane border takes hold of it and means nothing else: it
+            // must not move a selection, and must not count towards a double-click
+            // on the row behind it.
+            Mode::Keys | Mode::Zoom | Mode::Normal => {
+                if !app.drag_start(col, row) {
+                    app.mouse_click(col, row);
+                }
+            }
         },
+        // Any button rather than the left one alone: terminals differ on which bits
+        // a motion report carries, and nothing else is listening for these.
+        MouseEventKind::Drag(_) => app.drag_move(col),
+        MouseEventKind::Up(_) => app.drag_end(),
+        // Some terminals never report a button coming up. Motion with nothing held
+        // is proof that it did, somewhere we never heard about.
+        MouseEventKind::Moved => app.drag_end(),
         MouseEventKind::Down(MouseButton::Right) => app.mouse_back(),
         _ => {}
     }

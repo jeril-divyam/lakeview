@@ -23,6 +23,7 @@ use crate::config::{Config, Profile};
 use crate::jsonl::Folding;
 use crate::keys::{KeyFilter, MenuRow};
 use crate::lakefs::{Client, Commit, NamedRef, ObjectStats, RefKind, Repository};
+use crate::ui::{MIN_PREVIEW, MIN_REPOS, MIN_TREE};
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 /// How long the pane-one selection must settle before its ref's tree is
@@ -636,6 +637,34 @@ pub struct KeysMenu {
 
 // ── mouse hit-testing ────────────────────────────────────────────────────
 
+/// A pane border the mouse can take hold of, named for the pane on its left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Divider {
+    /// Between the repositories pane and the tree, so it moves `ui.repos_width`.
+    Repos,
+    /// Between the tree and the preview, so it moves the two ratios — and closes
+    /// the preview when shoved off the body's edge.
+    Tree,
+}
+
+/// One of those borders as the last render left it. Everything the drag
+/// arithmetic needs is here, so it never works the layout out a second time and
+/// gets a different answer than the frame it is moving.
+#[derive(Debug, Clone, Copy)]
+pub struct Handle {
+    pub which: Divider,
+    /// The border columns the divider is drawn as: two where two panes meet — the
+    /// left pane's right border and the right pane's left — and one where a closed
+    /// preview leaves the tree's border against the body's edge.
+    pub area: Rect,
+    /// Column the pane on the divider's left starts at, so a pointer column minus
+    /// this is that pane's width.
+    pub start: u16,
+    /// Columns from `start` to the end of the body: everything the panes either
+    /// side of the divider have to divide between them.
+    pub room: u16,
+}
+
 /// Screen regions recorded during the last render so mouse events can be
 /// mapped back to what was drawn there.
 #[derive(Default)]
@@ -660,6 +689,10 @@ pub struct Hits {
     pub commits: Option<Rect>,
     /// (tab, label area) for each tab in the header.
     pub tabs: Vec<(Tab, Rect)>,
+    /// The pane borders of the last render, left to right. Empty in any tab or
+    /// mode that isn't the three-pane browser, so a border can't be grabbed out
+    /// from under something else.
+    pub dividers: Vec<Handle>,
 }
 
 impl Hits {
@@ -672,6 +705,29 @@ impl Hits {
 const WHEEL_LINES: usize = 3;
 /// Two clicks on the same cell within this window count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// A pane border held by the mouse. The widths follow the pointer as it moves, so
+/// this is only what the gesture itself has to remember.
+#[derive(Debug, Clone, Copy)]
+struct Drag {
+    which: Divider,
+    /// Columns from the border's left cell to where the press landed, so the
+    /// border tracks the pointer instead of jumping a column under it.
+    grab: u16,
+    /// Width the preview had when the press landed, which a repositories|tree drag
+    /// holds it to so that only the grabbed border moves. `0` when the preview
+    /// wasn't showing.
+    preview_w: u16,
+    /// Whether the widths ever actually changed, so a click that happens to land
+    /// on a border is not a reason to rewrite the config file.
+    moved: bool,
+}
+
+/// How near the body's right edge the tree|preview border has to be shoved before
+/// the preview closes. The preview's own floor already stops the border twenty
+/// columns short of the edge, so those columns are the run-up and this is only
+/// slack for a terminal that reports the last column as the one before it.
+const COLLAPSE_SHOVE: u16 = 2;
 
 // ── app ──────────────────────────────────────────────────────────────────
 
@@ -713,6 +769,8 @@ pub struct App {
     pub hits: Hits,
     /// Cell and time of the last click, used to detect double-clicks.
     last_click: Option<(u16, u16, Instant)>,
+    /// The pane border the mouse has hold of, if any.
+    drag: Option<Drag>,
 }
 
 impl App {
@@ -749,6 +807,7 @@ impl App {
             target_dirty: None,
             hits: Hits::default(),
             last_click: None,
+            drag: None,
         };
         app.load_repos();
         if let Some(warning) = app.cfg.warnings.first().cloned() {
@@ -2390,6 +2449,172 @@ impl App {
     /// Right click mirrors `h`.
     pub fn mouse_back(&mut self) {
         self.back();
+    }
+
+    // ── dragging a pane border ───────────────────────────────────────────
+
+    /// The pane border a screen cell belongs to.
+    fn handle_at(&self, col: u16, row: u16) -> Option<Handle> {
+        self.hits
+            .dividers
+            .iter()
+            .find(|h| Hits::hit(h.area, col, row))
+            .copied()
+    }
+
+    fn handle(&self, which: Divider) -> Option<Handle> {
+        self.hits
+            .dividers
+            .iter()
+            .find(|h| h.which == which)
+            .copied()
+    }
+
+    /// Columns the preview was laid out with, or `0` when it isn't showing. Read
+    /// off the tree's border rather than `hits.preview`, whose padding is no
+    /// business of the layout arithmetic. A closed preview leaves that border on
+    /// the body's last column, which works out to `0` without a special case.
+    fn preview_width(&self) -> u16 {
+        let Some(h) = self.handle(Divider::Tree) else {
+            return 0;
+        };
+        let tree_w = (h.area.x + 1).saturating_sub(h.start);
+        h.room.saturating_sub(tree_w)
+    }
+
+    /// Take hold of a pane border. Answers whether the press landed on one, so a
+    /// press that didn't can go on to mean what it usually does: a border is the
+    /// one place in the body where a click is not a selection.
+    pub fn drag_start(&mut self, col: u16, row: u16) -> bool {
+        // Only the browser has borders to move, and the help tab draws over the
+        // ones the browser recorded without clearing them.
+        if self.tab != Tab::Browse {
+            return false;
+        }
+        let Some(handle) = self.handle_at(col, row) else {
+            return false;
+        };
+        self.drag = Some(Drag {
+            which: handle.which,
+            grab: col.saturating_sub(handle.area.x),
+            preview_w: self.preview_width(),
+            moved: false,
+        });
+        true
+    }
+
+    /// Move the held border to the pointer's column.
+    ///
+    /// The layout is read back out of the last render rather than remembered, so a
+    /// border that is no longer there — the tab switched, a zoom opened — ends the
+    /// drag rather than moving something that isn't on screen. That, not the
+    /// button coming up, is what a stranded drag is caught by.
+    pub fn drag_move(&mut self, col: u16) {
+        let Some(drag) = self.drag else { return };
+        let Some(handle) = self.handle(drag.which) else {
+            self.drag = None;
+            return;
+        };
+        let before = self.layout();
+        // Where the border's left column is being asked to go, as the width that
+        // would give the pane on its left.
+        let want = col
+            .saturating_sub(drag.grab)
+            .saturating_sub(handle.start)
+            .saturating_add(1);
+        match drag.which {
+            Divider::Repos => self.drag_repos(handle, want, drag.preview_w),
+            Divider::Tree => self.drag_tree(handle, want, col),
+        }
+        let after = self.layout();
+        if let Some(drag) = &mut self.drag {
+            drag.moved |= after != before;
+        }
+    }
+
+    /// The three numbers a drag writes, for telling whether it changed anything.
+    fn layout(&self) -> (u16, u16, u16) {
+        let ui = &self.cfg.ui;
+        (ui.repos_width, ui.tree_ratio, ui.preview_ratio)
+    }
+
+    /// The repositories|tree border. The preview keeps the columns it had, so the
+    /// border under the pointer is the only one that moves and the tree gives up
+    /// or takes back the difference — without that, moving this border would slide
+    /// the other one too, the ratios splitting what this border leaves over rather
+    /// than the screen. Where the preview is showing, the border also stops short
+    /// of crushing it rather than closing it by the back door.
+    fn drag_repos(&mut self, handle: Handle, want: u16, preview_w: u16) {
+        let keep = MIN_TREE + if self.hits.preview.is_some() { MIN_PREVIEW } else { 0 };
+        // `clamp` panics on an inverted range, and every ceiling here inverts on a
+        // body too narrow to hold the floors.
+        let ceiling = handle.room.saturating_sub(keep).max(MIN_REPOS);
+        let repos_w = want.clamp(MIN_REPOS, ceiling);
+        self.cfg.ui.repos_width = repos_w;
+
+        // A preview the user has closed is not resurrected by this border.
+        if preview_w > 0 {
+            let remainder = handle.room.saturating_sub(repos_w);
+            let ceiling = remainder.saturating_sub(MIN_TREE).max(MIN_PREVIEW);
+            let preview_w = preview_w.clamp(MIN_PREVIEW, ceiling);
+            self.cfg.ui.tree_ratio = remainder.saturating_sub(preview_w).max(1);
+            self.cfg.ui.preview_ratio = preview_w;
+        }
+    }
+
+    /// The tree|preview border. The ratios are written as the literal column
+    /// counts, which the layout then reproduces exactly: they sum to the room the
+    /// two panes divide, so its `room * tree / (tree + preview)` is `tree` on the
+    /// nose, and a wider terminal scales them instead.
+    ///
+    /// Its rightmost legal position leaves the preview at its floor, so
+    /// `MIN_PREVIEW` columns of dead travel sit between there and the body's edge:
+    /// the border stands still while the pointer crosses them, and only a shove
+    /// that arrives at the edge itself closes the preview. Coming back is the same
+    /// rule read backwards.
+    fn drag_tree(&mut self, handle: Handle, want: u16, col: u16) {
+        let last = handle
+            .start
+            .saturating_add(handle.room)
+            .saturating_sub(1);
+        if col.saturating_add(COLLAPSE_SHOVE) > last {
+            self.cfg.ui.preview_ratio = 0;
+            return;
+        }
+        // Tested against where the pointer is asking to go, not the width it ends
+        // up clamped to: the clamp would snap a whole preview open the instant the
+        // pointer left the edge, when what is wanted is the run-up in reverse.
+        if self.cfg.ui.preview_ratio == 0 && want > handle.room.saturating_sub(MIN_PREVIEW) {
+            return;
+        }
+        let ceiling = handle.room.saturating_sub(MIN_PREVIEW).max(MIN_TREE);
+        let tree_w = want.clamp(MIN_TREE, ceiling);
+        self.cfg.ui.tree_ratio = tree_w.max(1);
+        self.cfg.ui.preview_ratio = handle.room.saturating_sub(tree_w);
+    }
+
+    /// Let go. The widths were applied as the pointer moved, so all that is left is
+    /// writing them down — and only when something moved, so a click that lands on
+    /// a border doesn't touch the file.
+    pub fn drag_end(&mut self) {
+        if let Some(drag) = self.drag.take()
+            && drag.moved
+        {
+            self.save_layout();
+        }
+    }
+
+    /// The border being dragged, for the renderer to mark.
+    pub fn dragging(&self) -> Option<Divider> {
+        self.drag.map(|d| d.which)
+    }
+
+    /// Remember the layout a drag settled on. Failing to is worth a word in the
+    /// footer and nothing more: the panes have already moved.
+    fn save_layout(&mut self) {
+        if let Err(e) = self.cfg.save_layout() {
+            self.set_status(fmt_err(e), true);
+        }
     }
 
     // ── filter ───────────────────────────────────────────────────────────

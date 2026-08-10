@@ -321,6 +321,7 @@ Mouse support is on by default.
 | click a row | focus that pane and select the row |
 | double-click a row | expand / collapse it, or open it if there's nothing to expand |
 | right-click | collapse, or go back |
+| drag the border between two panes | resize them — see below |
 | wheel over the focused pane | move the selection (the preview follows) |
 | wheel over the other pane | scroll that pane's view only — no focus or selection change |
 | wheel over the preview | scroll the preview; in a zoomed `.json` / `.jsonl` the selection stays where it is and only comes along once the view would leave it behind |
@@ -332,6 +333,28 @@ Mouse support is on by default.
 Capturing the mouse takes over your terminal's click-drag text selection; most
 terminals still let you select with **Shift** held. If you'd rather keep native
 selection, set `mouse = false` under `[ui]` and everything stays keyboard-driven.
+
+### Resizing the panes
+
+Drag the border between two panes and they follow the pointer. The border wears
+the amber accent while you hold it, and a press on a border is only ever a grab —
+it never moves the selection behind it.
+
+No pane can be dragged away to nothing: each stops at its own floor. The one
+exception is the preview, which closes if you shove its border off the right-hand
+edge — the same thing `preview_ratio = 0` says. The border stops well short of the
+edge first, so the last stretch is deliberate rather than a slip; drag it back left
+far enough for a whole preview and it reopens.
+
+Where you leave a border is written to your config, so the layout survives a
+restart. Only `repos_width`, `tree_ratio` and `preview_ratio` are touched, and only
+those three lines: comments, spacing and key order all stay as they were, and a
+`${VAR}` credential is never read, rewritten or expanded on disk. The ratios are
+written as the column counts you dragged to, which is why they come back as
+something like `76` and `44` rather than `1` and `1` — they still mean the same
+thing, and a wider terminal still divides itself in the same proportion. If the
+file turns out not to be in a shape lakeview is sure it can edit, it says so in
+the footer and leaves the file alone rather than guessing.
 
 ## Commands
 
