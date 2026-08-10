@@ -105,8 +105,8 @@ secrets need not be stored on disk. `lakeview init` writes the file with mode
 | `j` `k` / `↓` `↑` | move |
 | `l` `→` | expand; at a pane's edge, move focus right; in a zoomed `.json` or `.jsonl`, unfold a row |
 | `Enter` | everything `→` does, and on a file it zooms the preview full-screen |
-| `h` `←` `Backspace` | collapse, else go to the parent; at the top level, move focus left; in a zoom, fold back up |
-| `Esc` | leave a zoom, or clear the search |
+| `h` `←` | collapse, else go to the parent; at the top level, move focus left; in a zoom, fold back up |
+| `Esc` `Backspace` | leave a zoom. Outside one, `Esc` clears the search and `Backspace` acts as `←` |
 | `space` | expand / collapse in place, without moving focus |
 | `g` / `G` | first / last entry |
 | `Ctrl-d` / `Ctrl-u` | half-page down / up |
@@ -183,8 +183,8 @@ members when the shape is what you are after.
 it back up as well, from its opening row or its closing bracket either way; `→`
 only ever opens, so pressing it on something already open leaves it alone. `←`
 winds back out the way it does in the tree, and stops once nothing is left to
-close; `Esc` leaves the zoom. The file's own brackets don't fold — collapsing a
-whole file to `{…}` says nothing.
+close; `Esc` or `Backspace` leaves the zoom. The file's own brackets don't fold —
+collapsing a whole file to `{…}` says nothing.
 
 Line numbers count the rows on show, so folding a block renumbers what is under
 it. The document is re-indented from the parsed value, so there is no original
@@ -225,8 +225,9 @@ descending is one direction, as it is in the tree.
 
 `←` winds back out the way it does in the tree: it folds what is open, steps out
 to the enclosing block when there is nothing there to fold, and stops once the
-whole record is folded again. Leaving the zoom is `Esc`'s alone — a key you hold
-down to fold your way up a record should not be able to lose you the file.
+whole record is folded again. `Esc` and `Backspace` are what leave the zoom — a key
+you hold down to fold your way up a record should not be able to lose you the file,
+which is why `←` isn't one of them.
 
 ### All at once
 
@@ -322,6 +323,7 @@ Mouse support is on by default.
 | double-click a row | expand / collapse it, or open it if there's nothing to expand |
 | right-click | collapse, or go back |
 | drag the border between two panes | resize them — see below |
+| click `«` / `»` under the repositories pane | fold it down to its marks, or back |
 | wheel over the focused pane | move the selection (the preview follows) |
 | wheel over the other pane | scroll that pane's view only — no focus or selection change |
 | wheel over the preview | scroll the preview; in a zoomed `.json` / `.jsonl` the selection stays where it is and only comes along once the view would leave it behind |
@@ -340,14 +342,39 @@ Drag the border between two panes and they follow the pointer. The border wears
 the amber accent while you hold it, and a press on a border is only ever a grab —
 it never moves the selection behind it.
 
-No pane can be dragged away to nothing: each stops at its own floor. The one
-exception is the preview, which closes if you shove its border off the right-hand
-edge — the same thing `preview_ratio = 0` says. The border stops well short of the
-edge first, so the last stretch is deliberate rather than a slip; drag it back left
-far enough for a whole preview and it reopens.
+No pane can be dragged away to nothing: each stops at its own floor. Two of them
+give way at the ends instead. Shove the preview's border off the right-hand edge
+and it closes — the same thing `preview_ratio = 0` says. Shove the repositories
+pane's border off the left and it folds down to a rail of its marks, which is
+`repos_width = 0`. Both borders stop well short of their edge first, so the last
+stretch is deliberate rather than a slip, and dragging back far enough for a whole
+pane brings it back.
+
+### Folding the repositories pane
+
+The `«` under the repositories pane folds it to a rail showing nothing but the mark
+on each row — `▸` and `▾` for repositories, `●` `○` `◇` for the branches and tags
+under an open one, indented a column so the shape still reads down it. `»` unfolds
+it again, to the width it was folded from.
+
+```
+╭ Repositories ───────── 1 ╮      ╭────╮
+│                          │      │    │
+│▌▸ quickstart        main │  «   │▌▸  │
+│                          │      │    │
+╰─────────── « ────────────╯      ╰ » ─╯
+```
+
+The rail keeps the same rows the full pane had, so folding never moves your
+selection, and the columns it gives up go to the tree. It also survives a terminal
+too narrow to have held the list at all, where the full pane would have dropped
+out.
 
 Where you leave a border is written to your config, so the layout survives a
-restart. Only `repos_width`, `tree_ratio` and `preview_ratio` are touched, and only
+restart — a folded pane included, since being folded is just `repos_width = 0`.
+The width to unfold *to* is only remembered for the session, so a pane that starts
+folded unfolds to the floor. Only `repos_width`, `tree_ratio` and `preview_ratio`
+are touched, and only
 those three lines: comments, spacing and key order all stay as they were, and a
 `${VAR}` credential is never read, rewritten or expanded on disk. The ratios are
 written as the column counts you dragged to, which is why they come back as

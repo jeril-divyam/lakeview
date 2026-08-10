@@ -20,9 +20,12 @@ use crate::theme::Theme;
 
 /// Floors the configured widths are held to, so no ratio can squeeze a pane
 /// down to nothing. The preview drops out before the tree reaches its floor.
-pub(crate) const MIN_REPOS: u16 = 12;
+pub(crate) const MIN_REPOS: u16 = 24;
 pub(crate) const MIN_TREE: u16 = 24;
 pub(crate) const MIN_PREVIEW: u16 = 20;
+/// Width of the repositories pane folded down to its markers: a border either
+/// side, the selection bar, a column of indent for a ref and the mark itself.
+const COLLAPSED_REPOS: u16 = 6;
 /// Room a tree row keeps for its name however deep it sits.
 const MIN_NAME: usize = 10;
 
@@ -33,6 +36,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     app.hits.preview_rows.clear();
     app.hits.commits = None;
     app.hits.dividers.clear();
+    app.hits.repos_toggle = None;
 
     // The key menu is a panel over the zoom rather than a place of its own, so
     // the zoom is still what is drawn under it.
@@ -46,11 +50,19 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     // drop out rather than being crushed — the preview goes first, then the
     // repository list, leaving the focused pane the whole width.
     let ui = &app.cfg.ui;
-    let show_repos = area.width >= MIN_REPOS + MIN_TREE;
-    let repos_w = ui
-        .repos_width
-        .max(MIN_REPOS)
-        .min(area.width.saturating_sub(MIN_TREE));
+    // `repos_width = 0` folds the pane down to its markers, the way
+    // `preview_ratio = 0` closes the preview. Folded it needs almost nothing, so it
+    // survives a terminal too narrow to have held the list.
+    let collapsed = ui.repos_width == 0;
+    let floor = if collapsed { COLLAPSED_REPOS } else { MIN_REPOS };
+    let show_repos = area.width >= floor + MIN_TREE;
+    let repos_w = if collapsed {
+        COLLAPSED_REPOS
+    } else {
+        ui.repos_width
+            .max(MIN_REPOS)
+            .min(area.width.saturating_sub(MIN_TREE))
+    };
     let remainder = area.width.saturating_sub(if show_repos { repos_w } else { 0 });
 
     let tree_ratio = ui.tree_ratio.max(1) as u32;
@@ -108,13 +120,16 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     if show_repos {
         let slot = chunks[next];
         next += 1;
-        app.hits.repos = Some(draw_repos(
+        let (inner, toggle) = draw_repos(
             frame,
             &mut app.repos,
             slot,
             app.focus == Focus::Repos,
             app.tick,
-        ));
+            collapsed,
+        );
+        app.hits.repos = Some(inner);
+        app.hits.repos_toggle = Some(toggle);
     }
 
     let slot = chunks[next];
@@ -149,6 +164,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 /// The list panes pass a grey `title_style` whether or not they have focus — the
 /// border and the selection bar already say where you are, so a pane's name and
 /// the ref it is showing are context rather than the thing to look at.
+///
+/// An empty title is left off altogether rather than written as nothing: a pane
+/// folded down to its markers has no room to name itself, and `truncate` given no
+/// room at all answers `…`, which would sit in the border saying nothing.
 fn pane_block<'a>(
     title: &str,
     title_style: Style,
@@ -156,20 +175,25 @@ fn pane_block<'a>(
     focused: bool,
     width: u16,
 ) -> Block<'a> {
-    Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Theme::border(focused))
-        .padding(Padding::top(1))
-        .title_top(Line::from(vec![
+        .padding(Padding::top(1));
+    if !title.is_empty() {
+        block = block.title_top(Line::from(vec![
             Span::raw(" "),
             Span::styled(
                 truncate(title, width.saturating_sub(8) as usize),
                 title_style,
             ),
             Span::raw(" "),
-        ]))
-        .title_top(Line::from(right).right_aligned())
+        ]));
+    }
+    if !right.is_empty() {
+        block = block.title_top(Line::from(right).right_aligned());
+    }
+    block
 }
 
 fn annotation<'a>(filter: &str, count: usize, ready: bool) -> Vec<Span<'a>> {
@@ -197,23 +221,30 @@ fn spinner(tick: usize) -> &'static str {
 
 // ── pane 1: repositories ─────────────────────────────────────────────────
 
+/// Returns the pane's inner area and the rect of the chevron that folds it, so a
+/// click on the one can be told from a click on the other.
 fn draw_repos(
     frame: &mut Frame,
     repos: &mut ReposView,
     area: Rect,
     focused: bool,
     tick: usize,
-) -> Rect {
-    let right = annotation(&repos.filter, repos.rows.len(), true);
-    let block = pane_block(
-        "Repositories",
-        Theme::title(false),
-        right,
-        focused,
-        area.width,
-    );
+    collapsed: bool,
+) -> (Rect, Rect) {
+    // Folded there is no room to name the pane or count it, and the markers are
+    // the whole of what it has to say.
+    let (title, right) = if collapsed {
+        ("", Vec::new())
+    } else {
+        (
+            "Repositories",
+            annotation(&repos.filter, repos.rows.len(), true),
+        )
+    };
+    let block = pane_block(title, Theme::title(false), right, focused, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let toggle = draw_repos_toggle(frame, area, collapsed);
 
     if repos.rows.is_empty() {
         let note = if !repos.filter.is_empty() {
@@ -223,8 +254,11 @@ fn draw_repos(
         } else {
             "empty"
         };
-        frame.render_widget(centered_note(note, Theme::faint()), inner);
-        return inner;
+        // Folded there is no width for a word; the empty rail speaks for itself.
+        if !collapsed {
+            frame.render_widget(centered_note(note, Theme::faint()), inner);
+        }
+        return (inner, toggle);
     }
 
     // Two columns go to the highlight bar and its trailing space.
@@ -232,7 +266,13 @@ fn draw_repos(
     let items: Vec<ListItem> = repos
         .rows
         .iter()
-        .map(|row| ListItem::new(render_repo_row(row, width, tick)))
+        .map(|row| {
+            ListItem::new(if collapsed {
+                render_repo_dot(row, tick)
+            } else {
+                render_repo_row(row, width, tick)
+            })
+        })
         .collect();
 
     let list = List::new(items)
@@ -241,11 +281,37 @@ fn draw_repos(
         .highlight_spacing(HighlightSpacing::Always)
         .scroll_padding(2);
     frame.render_stateful_widget(list, inner, &mut repos.state);
-    inner
+    (inner, toggle)
 }
 
-fn render_repo_row(row: &ReposRow, width: usize, tick: usize) -> Line<'static> {
-    let mut spans = Vec::new();
+/// The chevron that folds the repositories pane to its markers and unfolds it
+/// again, sitting in the bottom border where it is out of the rows' way. Drawn
+/// over the border rather than as a title so its exact cells are known and can be
+/// clicked.
+fn draw_repos_toggle(frame: &mut Frame, area: Rect, collapsed: bool) -> Rect {
+    let width = 3.min(area.width);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(1),
+        width,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            if collapsed { " » " } else { " « " },
+            Theme::dim(),
+        )),
+        rect,
+    );
+    rect
+}
+
+/// The glyph standing for a row, and the colour it wears.
+///
+/// A repository's chevron doubles as its icon. One with nothing to list takes the
+/// same `●` its lone default branch would have worn a row below — the row stands
+/// for that branch, so it wears its mark.
+fn repo_marker(row: &ReposRow, tick: usize) -> (&'static str, Style) {
     let style = match row.kind {
         RowKind::Repo => Style::new().fg(Theme::ACCENT),
         RowKind::Branch if row.primary => Style::new()
@@ -254,28 +320,41 @@ fn render_repo_row(row: &ReposRow, width: usize, tick: usize) -> Line<'static> {
         RowKind::Branch => Style::new().fg(Theme::FG),
         RowKind::Tag => Style::new().fg(Theme::PURPLE),
     };
+    let marker = match row.reference {
+        None if row.loading => spinner(tick),
+        None if row.expanded => "▾",
+        None if !row.expandable => "●",
+        None => "▸",
+        Some(_) => match row.kind {
+            RowKind::Branch if row.primary => "●",
+            RowKind::Branch => "○",
+            RowKind::Tag => "◇",
+            _ => " ",
+        },
+    };
+    (marker, style)
+}
 
-    // A repository's chevron doubles as its icon; refs indent beneath it. One
-    // with nothing to list takes the same `●` its lone default branch would have
-    // worn a row below — the row stands for that branch, so it wears its mark.
-    let prefix = match row.reference {
-        None if row.loading => format!("{} ", spinner(tick)),
-        None if row.expanded => "▾ ".into(),
-        None if !row.expandable => "● ".into(),
-        None => "▸ ".into(),
-        Some(_) => {
-            let icon = match row.kind {
-                RowKind::Branch if row.primary => "● ",
-                RowKind::Branch => "○ ",
-                RowKind::Tag => "◇ ",
-                _ => "  ",
-            };
-            format!("  {icon}")
-        }
+/// A row reduced to its mark, for the folded pane. A ref keeps the one column of
+/// indent that says it belongs to the row above, so the shape still reads down the
+/// rail with the names gone.
+fn render_repo_dot(row: &ReposRow, tick: usize) -> Line<'static> {
+    let (marker, style) = repo_marker(row, tick);
+    let indent = if row.reference.is_some() { " " } else { "" };
+    Line::from(vec![Span::raw(indent), Span::styled(marker, style)])
+}
+
+fn render_repo_row(row: &ReposRow, width: usize, tick: usize) -> Line<'static> {
+    let (marker, style) = repo_marker(row, tick);
+    // Refs indent beneath the repository they belong to.
+    let prefix = if row.reference.is_some() {
+        format!("  {marker} ")
+    } else {
+        format!("{marker} ")
     };
     let used = prefix.chars().count();
-    spans.push(Span::styled(prefix, style));
 
+    let mut spans = vec![Span::styled(prefix, style)];
     let (label, pad) = justify(&row.label, &row.meta, width.saturating_sub(used));
     spans.push(Span::styled(label, style));
     spans.push(Span::raw(pad));
@@ -2215,7 +2294,8 @@ mod tests {
     async fn a_drag_past_the_floor_stops_at_it() {
         let mut app = test_app();
         render(&mut app, 120, 24);
-        drag(&mut app, Divider::Repos, 0, 0, 120);
+        // Short of the floor but clear of the edge, which is where folding starts.
+        drag(&mut app, Divider::Repos, 0, 5, 120);
         assert_eq!(app.cfg.ui.repos_width, MIN_REPOS);
 
         let mut app = test_app();
@@ -2290,6 +2370,134 @@ mod tests {
 
         assert!(app.dragging().is_none(), "the drag outlived its border");
         assert_eq!(app.cfg.ui.repos_width, 28, "a border that is gone moved");
+    }
+
+
+
+    // ── folding the repositories pane to its markers ─────────────────────
+
+    /// One repository, so the rail has a mark to show.
+    fn with_a_repo(app: &mut App) {
+        app.on_msg(crate::app::Msg::Repos(
+            app.repos.req,
+            Ok(vec![crate::lakefs::Repository {
+                id: "quickstart".into(),
+                creation_date: 0,
+                default_branch: "main".into(),
+                storage_namespace: String::new(),
+            }]),
+        ));
+        assert!(!app.repos.rows.is_empty(), "no rows to fold");
+    }
+
+    #[tokio::test]
+    async fn a_folded_pane_shows_its_markers_and_nothing_else() {
+        let mut app = test_app();
+        with_a_repo(&mut app);
+
+        // The pane's own columns, since the detail pane names the selection too.
+        let pane = |app: &App, lines: &[String], width: u16| -> String {
+            let row = app.hits.repos.unwrap().y as usize;
+            lines[row].chars().take(width as usize).collect()
+        };
+
+        let lines = render(&mut app, 120, 24);
+        let unfolded = pane(&app, &lines, 28);
+        assert!(unfolded.contains("quickstart"), "{unfolded:?}");
+
+        app.cfg.ui.repos_width = 0;
+        let lines = render(&mut app, 120, 24);
+        let rail = pane(&app, &lines, COLLAPSED_REPOS);
+        assert!(rail.contains('▸'), "the mark is gone: {rail:?}");
+        assert!(
+            !rail.contains("quick"),
+            "the name survived the fold: {rail:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folded_pane_gives_its_columns_to_the_tree() {
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        let tree = app.hits.tree.unwrap().width;
+
+        app.cfg.ui.repos_width = 0;
+        render(&mut app, 120, 24);
+        assert_eq!(app.hits.repos.unwrap().width + 2, COLLAPSED_REPOS);
+        assert!(app.hits.tree.unwrap().width > tree, "the tree stayed put");
+    }
+
+    #[tokio::test]
+    async fn a_folded_pane_survives_a_terminal_too_narrow_for_the_list() {
+        let mut app = test_app();
+        // Unfolded, 32 columns is under the floor plus the tree's, so it drops out.
+        render(&mut app, 32, 24);
+        assert!(app.hits.repos.is_none());
+
+        // Folded it asks for almost nothing, so it stays.
+        app.cfg.ui.repos_width = 0;
+        render(&mut app, 32, 24);
+        assert!(app.hits.repos.is_some(), "the rail dropped out too");
+    }
+
+    #[tokio::test]
+    async fn shoving_the_first_border_off_the_left_edge_folds_the_pane() {
+        let mut app = test_app();
+        render(&mut app, 120, 24);
+        drag(&mut app, Divider::Repos, 0, 0, 120);
+        assert_eq!(app.cfg.ui.repos_width, 0, "the config's own fold value");
+        assert_eq!(app.hits.repos.unwrap().width + 2, COLLAPSED_REPOS);
+    }
+
+    #[tokio::test]
+    async fn a_folded_pane_stays_folded_until_a_whole_one_fits() {
+        let mut app = test_app();
+        app.cfg.ui.repos_width = 0;
+        render(&mut app, 120, 24);
+
+        // A few columns off the edge is not room for a pane.
+        drag(&mut app, Divider::Repos, 0, 12, 120);
+        assert_eq!(app.cfg.ui.repos_width, 0, "sprang back to its floor");
+
+        // Far enough out, and it returns.
+        drag(&mut app, Divider::Repos, 0, 39, 120);
+        assert_eq!(app.cfg.ui.repos_width, 40);
+    }
+
+    #[tokio::test]
+    async fn the_chevron_folds_the_pane_and_unfolds_it() {
+        let mut app = test_app();
+        app.cfg.ui.repos_width = 40;
+        render(&mut app, 120, 24);
+
+        // It sits in the bottom border, out of the rows' way.
+        let toggle = app.hits.repos_toggle.expect("no chevron was drawn");
+        assert_eq!(toggle.y, 23);
+
+        app.mouse_click(toggle.x, toggle.y);
+        assert_eq!(app.cfg.ui.repos_width, 0);
+
+        // And unfolding lands on the width it was folded from, not a default.
+        render(&mut app, 120, 24);
+        let toggle = app.hits.repos_toggle.unwrap();
+        app.mouse_click(toggle.x, toggle.y);
+        assert_eq!(app.cfg.ui.repos_width, 40);
+    }
+
+    #[tokio::test]
+    async fn folding_the_pane_does_not_move_the_selection() {
+        // The rail lists the same rows, so what was selected stays selected — and
+        // the chevron is a control, not a row, so clicking it selects nothing.
+        let mut app = test_app();
+        with_a_repo(&mut app);
+        render(&mut app, 120, 24);
+        let (focus, selected) = (app.focus, app.repos.state.selected());
+
+        let toggle = app.hits.repos_toggle.unwrap();
+        app.mouse_click(toggle.x, toggle.y);
+        assert_eq!(app.cfg.ui.repos_width, 0);
+        assert_eq!(app.focus, focus);
+        assert_eq!(app.repos.state.selected(), selected);
     }
 
     #[tokio::test]

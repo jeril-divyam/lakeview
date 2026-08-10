@@ -693,6 +693,9 @@ pub struct Hits {
     /// mode that isn't the three-pane browser, so a border can't be grabbed out
     /// from under something else.
     pub dividers: Vec<Handle>,
+    /// The chevron in the repositories pane's bottom border, which folds it down
+    /// to its markers and unfolds it again.
+    pub repos_toggle: Option<Rect>,
 }
 
 impl Hits {
@@ -771,6 +774,10 @@ pub struct App {
     last_click: Option<(u16, u16, Instant)>,
     /// The pane border the mouse has hold of, if any.
     drag: Option<Drag>,
+    /// Width the repositories pane had before it was folded, so unfolding lands
+    /// where it was rather than at a default. Held for the session only: the file
+    /// records that the pane is folded, which is the part worth keeping.
+    repos_restore: u16,
 }
 
 impl App {
@@ -781,6 +788,9 @@ impl App {
         client: Client,
         tx: UnboundedSender<Msg>,
     ) -> Self {
+        // A config that starts folded has no width to go back to, so unfolding
+        // lands on the floor.
+        let repos_restore = cfg.ui.repos_width.max(MIN_REPOS);
         let mut app = Self {
             cfg,
             profile_name,
@@ -808,6 +818,7 @@ impl App {
             hits: Hits::default(),
             last_click: None,
             drag: None,
+            repos_restore,
         };
         app.load_repos();
         if let Some(warning) = app.cfg.warnings.first().cloned() {
@@ -1850,6 +1861,20 @@ impl App {
         self.open();
     }
 
+    /// Leave a zoom, answering whether there was one to leave so the caller can
+    /// fall back to whatever its key otherwise means.
+    ///
+    /// `Esc` and `Backspace` both come through here. Neither is a key held down to
+    /// wind a document shut — that is `←`'s job, and why `←` stops at the last
+    /// fold instead of dropping out of the file with it.
+    pub fn leave_zoom(&mut self) -> bool {
+        if self.mode == Mode::Zoom {
+            self.mode = Mode::Normal;
+            return true;
+        }
+        false
+    }
+
     /// `←` — ascend: collapse, step to the parent, or move focus left.
     pub fn back(&mut self) {
         if self.zoomed() {
@@ -2371,6 +2396,13 @@ impl App {
             return;
         }
 
+        // A control rather than a row, like a tab: it is checked before the
+        // double-click bookkeeping so folding the pane can't read as one.
+        if self.repos_toggle_at(col, row) {
+            self.toggle_repos();
+            return;
+        }
+
         let now = Instant::now();
         let double = matches!(
             self.last_click,
@@ -2523,7 +2555,7 @@ impl App {
             .saturating_sub(handle.start)
             .saturating_add(1);
         match drag.which {
-            Divider::Repos => self.drag_repos(handle, want, drag.preview_w),
+            Divider::Repos => self.drag_repos(handle, want, col, drag.preview_w),
             Divider::Tree => self.drag_tree(handle, want, col),
         }
         let after = self.layout();
@@ -2544,7 +2576,21 @@ impl App {
     /// the other one too, the ratios splitting what this border leaves over rather
     /// than the screen. Where the preview is showing, the border also stops short
     /// of crushing it rather than closing it by the back door.
-    fn drag_repos(&mut self, handle: Handle, want: u16, preview_w: u16) {
+    ///
+    /// Shoved against the body's left edge it folds the pane down to its markers,
+    /// the mirror of the preview closing at the right, and stays folded until a
+    /// whole pane would fit again.
+    fn drag_repos(&mut self, handle: Handle, want: u16, col: u16, preview_w: u16) {
+        if col < handle.start.saturating_add(COLLAPSE_SHOVE) {
+            self.collapse_repos();
+            return;
+        }
+        // Tested against where the pointer is asking to go rather than the width it
+        // would be clamped to, which would spring the pane back to its floor the
+        // moment the pointer left the edge.
+        if self.cfg.ui.repos_width == 0 && want < MIN_REPOS {
+            return;
+        }
         let keep = MIN_TREE + if self.hits.preview.is_some() { MIN_PREVIEW } else { 0 };
         // `clamp` panics on an inverted range, and every ceiling here inverts on a
         // body too narrow to hold the floors.
@@ -2607,6 +2653,35 @@ impl App {
     /// The border being dragged, for the renderer to mark.
     pub fn dragging(&self) -> Option<Divider> {
         self.drag.map(|d| d.which)
+    }
+
+    /// Whether the cell is the repositories pane's fold chevron.
+    pub fn repos_toggle_at(&self, col: u16, row: u16) -> bool {
+        self.hits
+            .repos_toggle
+            .is_some_and(|a| Hits::hit(a, col, row))
+    }
+
+    /// Fold the repositories pane down to its markers, or unfold it again.
+    ///
+    /// Folded is `repos_width = 0`, the same way a closed preview is
+    /// `preview_ratio = 0` — one number the file already understands rather than a
+    /// second setting saying the same thing twice.
+    pub fn toggle_repos(&mut self) {
+        if self.cfg.ui.repos_width == 0 {
+            self.cfg.ui.repos_width = self.repos_restore.max(MIN_REPOS);
+        } else {
+            self.collapse_repos();
+        }
+        self.save_layout();
+    }
+
+    /// Fold the pane, remembering the width to unfold to.
+    fn collapse_repos(&mut self) {
+        if self.cfg.ui.repos_width > 0 {
+            self.repos_restore = self.cfg.ui.repos_width;
+        }
+        self.cfg.ui.repos_width = 0;
     }
 
     /// Remember the layout a drag settled on. Failing to is worth a word in the
@@ -3248,8 +3323,22 @@ mod tests {
         let shut = app.zoom_doc().unwrap().rows_len();
         assert!(shut < open, "`←` folded nothing: {shut} of {open} rows");
 
-        // `Esc` is the way out — see `on_key_normal`, which owns that key.
-        app.mode = Mode::Normal;
+        // `Esc` and `Backspace` are the way out.
+        assert!(app.leave_zoom());
         assert!(!app.zoomed());
+    }
+
+    /// `Esc` and `Backspace` share this, and each falls back to its own meaning
+    /// when there was no zoom: clearing the search, and stepping back up the tree.
+    #[tokio::test]
+    async fn leaving_a_zoom_says_whether_there_was_one() {
+        let mut app = app_on_a_file();
+        assert!(!app.leave_zoom(), "nothing was zoomed");
+
+        app.enter();
+        assert_eq!(app.mode, Mode::Zoom);
+        assert!(app.leave_zoom(), "the zoom went unreported");
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.leave_zoom(), "left twice");
     }
 }

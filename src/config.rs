@@ -61,8 +61,9 @@ pub struct Profile {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UiConfig {
-    /// Width of the repositories pane, in columns. `column_width` is accepted
-    /// as an alias so configs written for the old Miller-column layout load.
+    /// Width of the repositories pane, in columns; `0` folds it down to a rail of
+    /// its row markers. `column_width` is accepted as an alias so configs written
+    /// for the old Miller-column layout load.
     #[serde(default = "default_repos_width", alias = "column_width")]
     pub repos_width: u16,
     /// The tree's share of the width the repositories pane leaves over,
@@ -478,7 +479,7 @@ pub const TEMPLATE: &str = r#"# lakeview configuration — https://docs.lakefs.i
 default_profile = "local"
 
 [ui]
-repos_width = 28        # columns given to the repositories pane
+repos_width = 28        # columns for the repositories pane; 0 folds it to its marks
 tree_ratio = 1          # the tree and the preview divide the rest by these
 preview_ratio = 1       # two ratios; set preview_ratio = 0 to hide the pane
 preview_bytes = 65536   # max bytes fetched when previewing a file
@@ -773,9 +774,17 @@ mod tests {
         assert_eq!(again.ui.repos_width, 41);
         assert_eq!(again.ui.tree_ratio, 76);
         assert_eq!(again.ui.preview_ratio, 44);
-        // And the comments the user is meant to keep are still there.
+        // And the comment the user is meant to keep is still there — taken from the
+        // template rather than spelled out, so editing the template can't make this
+        // test wrong about what it is checking.
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("# columns given to the repositories pane"), "{raw}");
+        let comment = TEMPLATE
+            .lines()
+            .find(|l| l.starts_with("repos_width"))
+            .and_then(|l| l.split_once('#'))
+            .map(|(_, c)| c.trim_end().to_string())
+            .expect("the template's repos_width comment");
+        assert!(raw.contains(&comment), "lost `#{comment}`:\n{raw}");
     }
 
     #[test]

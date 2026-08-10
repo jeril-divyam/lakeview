@@ -13,7 +13,8 @@ const NAVIGATION: &[(&str, &str)] = &[
     ("k / ↑", "move up"),
     ("l / →", "expand / step right"),
     ("Enter", "open a file full-screen"),
-    ("h / ← / Bksp", "collapse / step left"),
+    ("h / ←", "collapse / step left"),
+    ("Bksp", "step left, or leave a zoom"),
     ("space", "expand / collapse in place"),
     ("g / G", "first / last entry"),
     ("Ctrl-d / Ctrl-u", "half-page down / up"),
@@ -45,7 +46,7 @@ zoomed .jsonl starts folded instead, listing its records a row apiece. \
 →, Enter or space unfolds the selected row a level at a time; \
 space folds it back up too, from its opening row or its closing bracket either way. ← winds back out, \
 folding what is open and stepping out of what is not, and does nothing once nothing is left to \
-close; Esc is what leaves the zoom. Folded rows are truncated — unfolding is how you see the rest \
+close; Esc and Backspace are what leave the zoom. Folded rows are truncated — unfolding is how you see the rest \
 — and everything else wraps. a on a folded row unfolds the whole document, all the way down; on \
 an open one it brings every record to the level that row is open to. c folds all of it back up. A \
 zoomed .json has nothing to level itself against, so a opens all of it and c shuts it to its own \
@@ -58,7 +59,8 @@ const MOUSE: &[(&str, &str)] = &[
     ("double-click", "expand / collapse, or open"),
     ("right-click", "collapse / go back"),
     ("wheel", "scroll under the cursor"),
-    ("drag a border", "resize the panes either side"),
+    ("drag border", "resize the panes either side"),
+    ("« / »", "fold the repositories pane"),
 ];
 
 const CONFIG: &str = "Profiles live in ~/.config/lakeview.toml. Each sets endpoint, access_key_id and \

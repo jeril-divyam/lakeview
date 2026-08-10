@@ -319,9 +319,7 @@ fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Esc => {
-            if app.mode == Mode::Zoom {
-                app.mode = Mode::Normal;
-            } else if !app.filter().is_empty() {
+            if !app.leave_zoom() && !app.filter().is_empty() {
                 app.filter_clear();
             }
         }
@@ -353,8 +351,16 @@ fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
                 app.enter();
             }
         }
-        KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+        KeyCode::Char('h') | KeyCode::Left => {
             if app.tab == Tab::Browse {
+                app.back();
+            }
+        }
+        // `←`'s twin in the tree, but in a zoom it means what `Esc` means: out.
+        // Unlike `←` it is not a key you hold down to fold your way up a record,
+        // so leaving on it cannot cost you the file you were reading.
+        KeyCode::Backspace => {
+            if !app.leave_zoom() && app.tab == Tab::Browse {
                 app.back();
             }
         }
