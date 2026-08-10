@@ -26,6 +26,10 @@ pub(crate) const MIN_PREVIEW: u16 = 20;
 /// Width of the repositories pane folded down to its markers: a border either
 /// side, the selection bar, a column of indent for a ref and the mark itself.
 const COLLAPSED_REPOS: u16 = 6;
+/// Rows of context the list panes keep around the selection. `List` enforces it
+/// by moving the view, so a wheel that holds the selection to an edge has to
+/// leave this much room or the render pulls the view straight back.
+pub(crate) const SCROLL_PADDING: usize = 2;
 /// Room a tree row keeps for its name however deep it sits.
 const MIN_NAME: usize = 10;
 
@@ -279,7 +283,7 @@ fn draw_repos(
         .highlight_style(Theme::selection(focused))
         .highlight_symbol(if focused { "▌" } else { " " })
         .highlight_spacing(HighlightSpacing::Always)
-        .scroll_padding(2);
+        .scroll_padding(SCROLL_PADDING);
     frame.render_stateful_widget(list, inner, &mut repos.state);
     (inner, toggle)
 }
@@ -437,7 +441,7 @@ fn draw_tree(
         .highlight_style(Theme::selection(focused))
         .highlight_symbol(if focused { "▌" } else { " " })
         .highlight_spacing(HighlightSpacing::Always)
-        .scroll_padding(2);
+        .scroll_padding(SCROLL_PADDING);
     frame.render_stateful_widget(list, inner, &mut tree.state);
     inner
 }
@@ -2372,6 +2376,125 @@ mod tests {
         assert_eq!(app.cfg.ui.repos_width, 28, "a border that is gone moved");
     }
 
+
+
+    // ── the wheel over a list pane ───────────────────────────────────────
+
+    /// A tree of `n` files at the top level, focused.
+    fn tree_of(n: usize) -> App {
+        let mut app = test_app();
+        app.tree.key = Some(("repo".into(), "main".into()));
+        app.on_msg(crate::app::Msg::Children {
+            generation: app.tree.generation,
+            prefix: String::new(),
+            res: Ok((0..n)
+                .map(|i| crate::lakefs::ObjectStats {
+                    path: format!("f{i:03}.txt"),
+                    path_type: "object".into(),
+                    size_bytes: Some(1),
+                })
+                .collect()),
+        });
+        app.focus = Focus::Tree;
+        assert_eq!(app.tree.rows.len(), n);
+        app
+    }
+
+    #[tokio::test]
+    async fn the_wheel_scrolls_the_focused_pane_at_once() {
+        // It used to walk the selection to the pane's edge before anything moved.
+        let mut app = tree_of(60);
+        render(&mut app, 120, 24);
+        let pane = app.hits.tree.unwrap();
+        assert_eq!(app.tree.state.offset(), 0);
+
+        app.mouse_scroll(pane.x, pane.y, true);
+        assert_eq!(app.tree.state.offset(), 3, "the view sat still");
+        // The selection came along, held just inside the edge it was about to
+        // leave by — `List` keeps that much context around it, and a selection
+        // flush against the edge would cost most of the notch to enforcing it.
+        assert_eq!(app.tree.state.selected(), Some(3 + SCROLL_PADDING));
+        assert!(app.preview.dirty_since.is_some(), "the preview didn't follow");
+    }
+
+    #[tokio::test]
+    async fn the_wheel_leaves_a_selection_the_view_still_holds() {
+        let mut app = tree_of(60);
+        app.tree.state.select(Some(10));
+        render(&mut app, 120, 24);
+        let pane = app.hits.tree.unwrap();
+        app.preview.dirty_since = None;
+
+        app.mouse_scroll(pane.x, pane.y, true);
+        assert_eq!(app.tree.state.offset(), 3);
+        assert_eq!(app.tree.state.selected(), Some(10), "it was dragged along");
+        assert!(
+            app.preview.dirty_since.is_none(),
+            "nothing was selected, so nothing needed fetching"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrolling_up_holds_the_selection_to_the_bottom_edge() {
+        let mut app = tree_of(60);
+        app.tree.state.select(Some(40));
+        render(&mut app, 120, 24);
+        let pane = app.hits.tree.unwrap();
+        let height = pane.height as usize;
+        let top = app.tree.state.offset();
+        assert!(top > 3, "not scrolled far enough down to scroll back up");
+
+        app.mouse_scroll(pane.x, pane.y, false);
+        assert_eq!(app.tree.state.offset(), top - 3);
+        assert_eq!(
+            app.tree.state.selected(),
+            Some(top - 3 + height - 1 - SCROLL_PADDING)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wheel_stops_with_the_last_row_on_screen() {
+        let mut app = tree_of(30);
+        render(&mut app, 120, 24);
+        let pane = app.hits.tree.unwrap();
+        let max = 30 - pane.height as usize;
+
+        for _ in 0..20 {
+            app.mouse_scroll(pane.x, pane.y, true);
+        }
+        assert_eq!(app.tree.state.offset(), max, "scrolled past the end");
+        // Scrolling down, the selection rides just inside the top edge.
+        assert_eq!(app.tree.state.selected(), Some(max + SCROLL_PADDING));
+    }
+
+    #[tokio::test]
+    async fn a_list_shorter_than_its_pane_does_not_scroll() {
+        let mut app = tree_of(4);
+        render(&mut app, 120, 24);
+        let pane = app.hits.tree.unwrap();
+
+        app.mouse_scroll(pane.x, pane.y, true);
+        assert_eq!(app.tree.state.offset(), 0);
+        assert_eq!(app.tree.state.selected(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn the_wheel_over_the_other_pane_only_peeks() {
+        let mut app = tree_of(60);
+        render(&mut app, 120, 24);
+        let pane = app.hits.tree.unwrap();
+        app.focus = Focus::Repos;
+        app.preview.dirty_since = None;
+
+        app.mouse_scroll(pane.x, pane.y, true);
+        assert_eq!(app.tree.state.offset(), 3, "the view didn't move");
+        assert_eq!(app.tree.state.selected(), Some(0), "the selection moved");
+        assert_eq!(app.focus, Focus::Repos, "the focus moved");
+        assert!(app.preview.dirty_since.is_none());
+        // Note this is the offset the peek *asks* for. `List` pulls a selection
+        // left off screen back into view, so the next frame undoes a peek that
+        // scrolled past the selected row — see the comment on `wheel_list`.
+    }
 
 
     // ── folding the repositories pane to its markers ─────────────────────

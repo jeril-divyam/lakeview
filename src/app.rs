@@ -23,7 +23,7 @@ use crate::config::{Config, Profile};
 use crate::jsonl::Folding;
 use crate::keys::{KeyFilter, MenuRow};
 use crate::lakefs::{Client, Commit, NamedRef, ObjectStats, RefKind, Repository};
-use crate::ui::{MIN_PREVIEW, MIN_REPOS, MIN_TREE};
+use crate::ui::{MIN_PREVIEW, MIN_REPOS, MIN_TREE, SCROLL_PADDING};
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 /// How long the pane-one selection must settle before its ref's tree is
@@ -2306,24 +2306,80 @@ impl App {
             return;
         };
 
-        if focus == self.focus {
-            // The focused pane tracks the wheel like j/k, so the preview follows.
-            self.move_selection(delta);
+        // The focused pane carries its selection along; the other one just peeks,
+        // leaving the selection and the focus where they are.
+        self.wheel_list(focus, area, down, focus == self.focus);
+    }
+
+    /// The wheel over a list pane scrolls the view, and — when `stick` — carries
+    /// the selection along only once the view would leave it behind, at which
+    /// point it holds to the edge it was about to go out by. This is the wheel a
+    /// zoomed document gets, for the same reason: driving the selection instead
+    /// would spend the first notches walking it across the pane before anything
+    /// scrolled at all.
+    ///
+    /// Stopping once the last row is on screen means a list shorter than its
+    /// viewport doesn't scroll at all.
+    ///
+    /// Without `stick` the scroll is only as durable as the selection allows:
+    /// `List` pulls a selected row that has gone off screen back into view, so a
+    /// peek past the selected row is undone by the next frame. Sticking the
+    /// selection to the edge is what keeps the render from arguing.
+    fn wheel_list(&mut self, focus: Focus, area: Rect, down: bool, stick: bool) {
+        let height = area.height as usize;
+        let len = match focus {
+            Focus::Repos => self.repos.rows.len(),
+            Focus::Tree => self.tree.rows.len(),
+        };
+        if len == 0 || height == 0 {
+            return;
+        }
+        let state = match focus {
+            Focus::Repos => &mut self.repos.state,
+            Focus::Tree => &mut self.tree.state,
+        };
+
+        let max = len.saturating_sub(height);
+        let top = state.offset().min(max);
+        let new_top = if down {
+            (top + WHEEL_LINES).min(max)
         } else {
-            // The other pane just peeks: scroll the view, leave the selection
-            // and the focus alone. Stop once the last row is on screen, so a
-            // list shorter than its viewport doesn't scroll at all.
-            let (state, len) = match focus {
-                Focus::Repos => (&mut self.repos.state, self.repos.rows.len()),
-                Focus::Tree => (&mut self.tree.state, self.tree.rows.len()),
-            };
-            let max = len.saturating_sub(area.height as usize);
-            let offset = state.offset_mut();
-            *offset = if down {
-                (*offset + WHEEL_LINES).min(max)
-            } else {
-                offset.saturating_sub(WHEEL_LINES)
-            };
+            top.saturating_sub(WHEEL_LINES)
+        };
+        if new_top == top {
+            return;
+        }
+        *state.offset_mut() = new_top;
+        if !stick {
+            return;
+        }
+
+        // A row is one line here, so the view holds exactly `height` of them and
+        // the selection has only to be clamped between its edges. Left outside
+        // them, the render would drag the view back to it and undo the scroll.
+        //
+        // Not quite the edges, though: `List` keeps `SCROLL_PADDING` rows of
+        // context around the selection, and enforces it by moving the view — so a
+        // selection left flush against an edge costs most of the notch. At the
+        // ends of the list there is nowhere further to scroll, so it doesn't apply.
+        let pad = SCROLL_PADDING.min(height.saturating_sub(1) / 2);
+        let last = if new_top == max {
+            new_top + height - 1
+        } else {
+            new_top + height - 1 - pad
+        }
+        .min(len - 1);
+        let first = if new_top == 0 { 0 } else { new_top + pad }.min(last);
+
+        let selected = state.selected().unwrap_or(first);
+        let stuck = selected.clamp(first, last);
+        if stuck == selected {
+            return;
+        }
+        state.select(Some(stuck));
+        match focus {
+            Focus::Repos => self.sync_target(),
+            Focus::Tree => self.mark_preview_dirty(),
         }
     }
 

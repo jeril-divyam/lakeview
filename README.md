@@ -324,7 +324,7 @@ Mouse support is on by default.
 | right-click | collapse, or go back |
 | drag the border between two panes | resize them — see below |
 | click `«` / `»` under the repositories pane | fold it down to its marks, or back |
-| wheel over the focused pane | move the selection (the preview follows) |
+| wheel over the focused pane | scroll the view; the selection stays where it is and only comes along once the view would leave it behind |
 | wheel over the other pane | scroll that pane's view only — no focus or selection change |
 | wheel over the preview | scroll the preview; in a zoomed `.json` / `.jsonl` the selection stays where it is and only comes along once the view would leave it behind |
 | double-click a zoomed `.json` / `.jsonl` row | unfold or fold it |

@@ -10,7 +10,7 @@ mod overlay;
 // The pane floors, which `App` clamps a dragged border against. They live beside
 // the layout that enforces them, but the collapse rule they feed is policy and
 // belongs with the rest of the mouse handling.
-pub(crate) use browse::{MIN_PREVIEW, MIN_REPOS, MIN_TREE};
+pub(crate) use browse::{MIN_PREVIEW, MIN_REPOS, MIN_TREE, SCROLL_PADDING};
 
 use chrono::{Local, TimeZone};
 use humansize::{DECIMAL, format_size};
