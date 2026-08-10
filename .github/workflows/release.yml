@@ -100,6 +100,22 @@ jobs:
       - name: Check cmake is available
         run: cmake --version
 
+      # That C has to be compiled *for musl*, and cc-rs goes looking for a
+      # `<target>-gcc` no runner image has, so the build dies in aws-lc-sys.
+      # musl-tools brings the wrapper and names it both ways, and CC_<target>
+      # says which to use whichever name the arch's package settled on.
+      #
+      # This is a compiler for the C dependencies and nothing more. Do not go on
+      # to set CARGO_TARGET_*_LINKER to it: Ubuntu's musl-gcc specs produce a
+      # static-PIE that segfaults on startup on x86_64, whereas rustc's bundled
+      # musl and self-contained linking are already right.
+      - name: Install a musl C compiler
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_$(echo '${{ matrix.target }}' | tr '-' '_')=musl-gcc" >> "$GITHUB_ENV"
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
