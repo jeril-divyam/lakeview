@@ -315,7 +315,7 @@ Mouse support is on by default.
 | right-click | collapse, or go back |
 | wheel over the focused pane | move the selection (the preview follows) |
 | wheel over the other pane | scroll that pane's view only — no focus or selection change |
-| wheel over the preview | scroll the preview, or move the selection in a zoomed `.json` / `.jsonl` |
+| wheel over the preview | scroll the preview; in a zoomed `.json` / `.jsonl` the selection stays where it is and only comes along once the view would leave it behind |
 | double-click a zoomed `.json` / `.jsonl` row | unfold or fold it |
 | click a key in the `F` menu | switch it on or off |
 | click away from that menu | close it, keeping the switches |

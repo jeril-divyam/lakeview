@@ -657,6 +657,9 @@ pub struct Hits {
     /// The layout is the only account of how tall a row came out, and paging
     /// needs that for rows off screen as well as on it.
     pub preview_row_starts: Vec<usize>,
+    /// Lines the whole of that document laid out to, which is what the end of
+    /// its scroll is measured against.
+    pub preview_lines: usize,
     /// Inner area of the commit list.
     pub commits: Option<Rect>,
     /// (tab, label area) for each tab in the header.
@@ -2184,10 +2187,8 @@ impl App {
 
         // Zoomed preview, or the preview pane in the normal layout.
         if self.zoomed() || self.hits.preview.is_some_and(|a| Hits::hit(a, col, row)) {
-            // A zoomed JSONL preview is the focused list, so the wheel moves its
-            // selection the way it does in any other focused pane.
             if self.zoom_doc().is_some() {
-                self.move_selection(delta);
+                self.wheel_zoom(down);
                 return;
             }
             self.preview.scroll = if down {
@@ -2220,6 +2221,62 @@ impl App {
             } else {
                 offset.saturating_sub(WHEEL_LINES)
             };
+        }
+    }
+
+    /// The wheel over a zoomed foldable document scrolls the view, and carries
+    /// the selection along only once the view would leave it behind — at which
+    /// point it sticks to the edge it was about to go out by. A wheel that drove
+    /// the selection instead would spend its first notches crossing the pane
+    /// before anything scrolled at all.
+    ///
+    /// The view is held to whole rows, since a row half on screen is pulled back
+    /// into it by the render, so the selection may only be left on a row that
+    /// fits entirely between the new view's edges.
+    fn wheel_zoom(&mut self, down: bool) {
+        let Some(rows_len) = self.zoom_doc().map(|doc| doc.rows_len()) else {
+            return;
+        };
+        // Without a frame to measure there is no telling what a notch moves.
+        let height = self.hits.preview.map_or(0, |a| a.height as usize);
+        if rows_len == 0 || height == 0 || self.hits.preview_row_starts.is_empty() {
+            return;
+        }
+
+        let max_top = self.hits.preview_lines.saturating_sub(height);
+        let top = (self.preview.scroll as usize).min(max_top);
+        let new_top = if down {
+            (top + WHEEL_LINES).min(max_top)
+        } else {
+            top.saturating_sub(WHEEL_LINES)
+        };
+        if new_top == top {
+            return;
+        }
+
+        let Some((first, last)) = rows_within(
+            &self.hits.preview_row_starts,
+            self.hits.preview_lines,
+            rows_len,
+            new_top,
+            height,
+        ) else {
+            // A row taller than the pane fills the view on its own, so no scroll
+            // position holds: the render puts the view back to that row's start.
+            // Move the selection off it instead, which is the only thing that
+            // shifts the view here.
+            self.move_selection(if down {
+                WHEEL_LINES as isize
+            } else {
+                -(WHEEL_LINES as isize)
+            });
+            return;
+        };
+
+        let cursor = self.zoom_doc().map_or(0, |doc| doc.cursor());
+        self.preview.scroll = new_top.min(u16::MAX as usize) as u16;
+        if let Some(doc) = self.zoom_doc_mut() {
+            doc.set_cursor(cursor.clamp(first, last));
         }
     }
 
@@ -2408,6 +2465,37 @@ impl App {
 /// would be showing there anyway.
 fn row_at_line(starts: &[usize], line: usize) -> usize {
     starts.partition_point(|start| *start <= line).saturating_sub(1)
+}
+
+/// The first and last row lying wholly inside the `height` lines from `top`,
+/// given the line each row starts at and the `total` the document laid out to.
+///
+/// `None` when nothing fits: one row taller than the view covers it all, and
+/// there is no row the selection could rest on without the view being dragged
+/// back to that row's start.
+fn rows_within(
+    starts: &[usize],
+    total: usize,
+    rows_len: usize,
+    top: usize,
+    height: usize,
+) -> Option<(usize, usize)> {
+    // The layout is a frame old, so trust it only as far as the document goes.
+    let last_row = rows_len.min(starts.len()).checked_sub(1)?;
+    let bottom = top + height;
+    // A row's lines run up to where the row below it starts; the final row's run
+    // to the end of the document.
+    let end = |row: usize| starts.get(row + 1).copied().unwrap_or(total);
+
+    let first = starts.partition_point(|start| *start < top);
+    if first > last_row || end(first) > bottom {
+        return None;
+    }
+    let mut last = first;
+    while last < last_row && end(last + 1) <= bottom {
+        last += 1;
+    }
+    Some((first, last))
 }
 
 fn fmt_err(e: anyhow::Error) -> String {
@@ -2761,6 +2849,41 @@ mod tests {
         // Paging asks about the line under the bottom edge, which is off the end
         // of a body shorter than the pane.
         assert_eq!(row_at_line(&[0, 1, 4], 99), 2);
+    }
+
+    // ── the wheel over the zoom ──────────────────────────────────────────
+
+    #[test]
+    fn the_rows_a_view_holds_whole_are_the_ones_inside_its_edges() {
+        // Six one-line rows; the view is three lines tall, two lines down.
+        let starts = [0, 1, 2, 3, 4, 5];
+        assert_eq!(rows_within(&starts, 6, 6, 2, 3), Some((2, 4)));
+        // At the top, and at the end where the last row's own lines run out.
+        assert_eq!(rows_within(&starts, 6, 6, 0, 3), Some((0, 2)));
+        assert_eq!(rows_within(&starts, 6, 6, 3, 3), Some((3, 5)));
+    }
+
+    #[test]
+    fn a_row_the_view_cuts_in_half_is_not_one_of_them() {
+        // Row 1 wraps over lines 1..4. A view of lines 0..3 can't hold it whole,
+        // so the selection may only rest on row 0.
+        let starts = [0, 1, 4];
+        assert_eq!(rows_within(&starts, 5, 3, 0, 3), Some((0, 0)));
+        // Started at its second line, the row is cut at the top instead.
+        assert_eq!(rows_within(&starts, 5, 3, 2, 3), Some((2, 2)));
+    }
+
+    #[test]
+    fn a_row_taller_than_the_view_leaves_nowhere_to_rest() {
+        // One row over ten lines: whatever the view shows, it shows part of it.
+        assert_eq!(rows_within(&[0], 10, 1, 0, 4), None);
+        assert_eq!(rows_within(&[0], 10, 1, 3, 4), None);
+    }
+
+    #[test]
+    fn a_document_shorter_than_the_view_is_held_whole() {
+        assert_eq!(rows_within(&[0, 1], 2, 2, 0, 20), Some((0, 1)));
+        assert_eq!(rows_within(&[], 0, 0, 0, 20), None);
     }
 
     #[test]

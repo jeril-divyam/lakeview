@@ -474,6 +474,7 @@ fn draw_zoom(frame: &mut Frame, app: &mut App, area: Rect) {
     app.preview.scroll = top.min(u16::MAX as usize) as u16;
 
     app.hits.preview_row_starts = row_starts(&lines);
+    app.hits.preview_lines = lines.len();
     let visible = lines.iter().skip(top).take(height);
     app.hits.preview_rows = visible.clone().map(|(row, _)| *row).collect();
     for (y, (_, line)) in visible.enumerate() {
@@ -844,13 +845,13 @@ fn tree_detail(app: &App, width: u16) -> Vec<Line<'static>> {
         return lines;
     }
 
-    lines.extend(object_details(&node.stat));
+    lines.extend(object_details(&node.stat, width));
     lines.push(Line::raw(""));
     lines.extend(preview_lines(app, width));
     lines
 }
 
-fn object_details(obj: &crate::lakefs::ObjectStats) -> Vec<Line<'static>> {
+fn object_details(obj: &crate::lakefs::ObjectStats, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![
         kv(
             "size",
@@ -870,7 +871,15 @@ fn object_details(obj: &crate::lakefs::ObjectStats) -> Vec<Line<'static>> {
     if !obj.physical_address.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled("physical address", Theme::faint()));
-        lines.push(Line::styled(obj.physical_address.clone(), Theme::dim()));
+        // The part that identifies the object is at the end of it, so clipping
+        // this at the pane's edge would keep the half worth nothing. It is one
+        // unbroken word, so it breaks hard at the margin; the label above it
+        // stands in for a gutter, and the continuations start at it.
+        lines.extend(wrap_line(
+            Line::styled(obj.physical_address.clone(), Theme::dim()),
+            width as usize,
+            0,
+        ));
     }
     lines
 }
@@ -1035,6 +1044,42 @@ mod tests {
     fn a_pane_too_narrow_to_wrap_is_left_alone() {
         let line = Line::from(vec![Span::raw(" 1 "), Span::raw("something long")]);
         assert_eq!(wrapped(line, 4).len(), 1);
+    }
+
+    /// The side pane clips what it can't fit, and the end of a physical address
+    /// is the part that names the object, so it is wrapped before it gets there.
+    #[test]
+    fn a_physical_address_is_wrapped_rather_than_clipped() {
+        let obj = crate::lakefs::ObjectStats {
+            path: "data/curated/daily_rollup.json".into(),
+            path_type: "object".into(),
+            physical_address: format!("s3://bucket/lakefs/data/{}", "g".repeat(60)),
+            checksum: String::new(),
+            size_bytes: Some(56),
+            mtime: 0,
+            content_type: None,
+        };
+        let width = 28;
+
+        let lines = object_details(&obj, width);
+        let label = lines
+            .iter()
+            .position(|l| text(l) == "physical address")
+            .expect("the address should be labelled");
+        let address = &lines[label + 1..];
+        assert!(address.len() > 1, "expected it to wrap: {address:?}");
+        assert_eq!(
+            address.iter().map(text).collect::<String>(),
+            obj.physical_address,
+            "every character of it should be on show"
+        );
+        for line in address {
+            let rendered = text(line);
+            assert!(
+                rendered.width() <= width as usize,
+                "{rendered:?} is wider than the pane"
+            );
+        }
     }
 
     // ── the zoomed JSONL view ────────────────────────────────────────────
@@ -1491,6 +1536,94 @@ mod tests {
 
         app.page(true);
         assert!(cursor(&app) > 0, "the page did not get past the long row");
+    }
+
+    /// The wheel scrolls the view straight away and leaves the selection where
+    /// it is, carrying it along only when the view would otherwise leave it
+    /// behind — at which point it stays on the edge it went out by.
+    #[tokio::test]
+    async fn the_wheel_scrolls_the_zoom_and_only_then_takes_the_selection() {
+        let mut app = test_app();
+        let text: String = (0..40).map(|i| format!("{{\"n\":{i}}}\n")).collect();
+        app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(&text, false)));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+
+        let cursor = |app: &App| app.zoom_doc().expect("a foldable zoom").cursor();
+        let buffer = framed(&mut app, 60, 24);
+        let pane = app.hits.preview.expect("the zoom records its own area");
+        let height = pane.height as usize;
+        // Every record folds onto a row of one line, so lines and rows are the
+        // same thing here and the whole file is taller than the pane.
+        assert!(height > 6 && height < 40, "unexpected pane height {height}");
+        assert!(top_row(&buffer, pane).contains(r#"{"n": 0}"#));
+
+        // A record well inside the view, so the wheel has somewhere to move to
+        // before the selection is in its way.
+        app.move_selection(5);
+        assert_eq!(app.preview.scroll, 0);
+
+        // One notch scrolls, and leaves the selection alone.
+        app.mouse_scroll(pane.x, pane.y, true);
+        assert_eq!(app.preview.scroll as usize, 3);
+        assert_eq!(cursor(&app), 5, "the wheel moved the selection, not the view");
+
+        // The next notch takes the top edge past it, so it comes along and stays
+        // there — the top row on screen is the selected one from here on.
+        app.mouse_scroll(pane.x, pane.y, true);
+        assert_eq!(app.preview.scroll as usize, 6);
+        assert_eq!(cursor(&app), 6);
+        let buffer = framed(&mut app, 60, 24);
+        let top = top_row(&buffer, pane);
+        assert!(top.contains(r#"{"n": 6}"#), "{top:?}");
+
+        // Back up: the view moves, and the selection — now well inside it —
+        // stays put.
+        app.mouse_scroll(pane.x, pane.y, false);
+        assert_eq!(app.preview.scroll as usize, 3);
+        assert_eq!(cursor(&app), 6);
+
+        // The end of the file stops the view rather than it running off, and the
+        // selection settles on the first row of that last screenful.
+        for _ in 0..40 {
+            app.mouse_scroll(pane.x, pane.y, true);
+        }
+        assert_eq!(app.preview.scroll as usize, 40 - height);
+        assert_eq!(cursor(&app), 40 - height);
+        let buffer = framed(&mut app, 60, 24);
+        assert!(screen(&buffer).contains(r#"{"n": 39}"#));
+
+        // Scrolling up off a selection at the bottom edge drags it the other way.
+        app.select_edge(false);
+        framed(&mut app, 60, 24);
+        assert_eq!(cursor(&app), 39);
+        app.mouse_scroll(pane.x, pane.y, false);
+        assert_eq!(app.preview.scroll as usize, 40 - height - 3);
+        assert_eq!(cursor(&app), 36, "the selection should hug the bottom edge");
+    }
+
+    /// A row taller than the pane can only be shown from its own start, so there
+    /// is no scroll position for the wheel to hold. It moves the selection then,
+    /// which is the only thing that shifts the view over such a row.
+    #[tokio::test]
+    async fn the_wheel_gets_past_a_row_taller_than_the_pane() {
+        let mut app = test_app();
+        let wide = format!(r#"{{"k":"{}"}}"#, "x".repeat(2000));
+        let mut doc = crate::jsonl::parse(&format!("{wide}\n{{\"n\":1}}\n"), false);
+        doc.toggle_row(0);
+        app.preview.body = Some(PreviewBody::Jsonl(doc));
+        app.mode = Mode::Zoom;
+        app.focus = Focus::Tree;
+
+        let pane = {
+            framed(&mut app, 60, 24);
+            app.hits.preview.expect("the zoom records its own area")
+        };
+        let cursor = |app: &App| app.zoom_doc().expect("a foldable zoom").cursor();
+        assert_eq!(cursor(&app), 0);
+
+        app.mouse_scroll(pane.x, pane.y, true);
+        assert!(cursor(&app) > 0, "the wheel did not get past the long row");
     }
 
     /// Paging belongs to the foldable zoom. A flat body is scrolled rather than
