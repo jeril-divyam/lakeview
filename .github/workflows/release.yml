@@ -117,9 +117,11 @@ jobs:
         run: |
           name="lakeview_${{ needs.resolve.outputs.version }}_${{ matrix.asset }}.tar.gz"
           staging=$(mktemp -d)
+          # LICENSE travels with the binary: MIT asks for the notice to be
+          # included in copies, and a tarball is a copy.
           cp "target/${{ matrix.target }}/release/lakeview" \
-             README.md lakeview.example.toml "$staging/"
-          tar -czf "$name" -C "$staging" lakeview README.md lakeview.example.toml
+             README.md LICENSE lakeview.example.toml "$staging/"
+          tar -czf "$name" -C "$staging" lakeview README.md LICENSE lakeview.example.toml
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v7

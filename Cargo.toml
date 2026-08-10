@@ -3,6 +3,7 @@ name = "lakeview"
 version = "0.1.0"
 edition = "2024"
 description = "A terminal browser for lakeFS"
+license = "MIT"
 readme = "README.md"
 keywords = ["lakefs", "tui", "ratatui", "data"]
 categories = ["command-line-utilities"]
