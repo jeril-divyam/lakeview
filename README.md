@@ -36,6 +36,23 @@ repository that has them still expands.
 ## Install
 
 ```sh
+brew install jeril-divyam/tap/lakeview
+```
+
+Or take a binary from the [latest release](https://github.com/jeril-divyam/lakeview/releases/latest)
+and drop it somewhere on your `PATH`:
+
+```sh
+tar xzf lakeview_*_linux_amd64.tar.gz
+install -m755 lakeview ~/.local/bin/
+```
+
+Builds are published for macOS on Apple silicon and for Linux on x86_64 and
+arm64. The Linux binaries are statically linked against musl, so they do not
+care which distro or glibc version you are on. Anything else builds from
+source:
+
+```sh
 cargo build --release
 install -m755 target/release/lakeview ~/.local/bin/
 ```

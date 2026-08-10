@@ -1,0 +1,180 @@
+name: release
+
+# Builds lakeview for macOS and Linux and attaches the tarballs to the GitHub
+# release for the tag. Asset names follow the convention the formulae in
+# jeril-divyam/homebrew-tap expect: lakeview_<version>_<os>_<arch>.tar.gz
+on:
+  push:
+    tags: ["v*"]
+  # Lets you (re)build assets for a tag that is already pushed.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and upload assets for (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the shipped binaries small without touching the release profile.
+  RUSTFLAGS: "-C strip=symbols"
+
+jobs:
+  resolve:
+    name: resolve tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.out.outputs.tag }}
+      version: ${{ steps.out.outputs.version }}
+    steps:
+      - id: out
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: test
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+      - name: Check the version matches the tag
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          toml=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$toml" != "$VERSION" ]; then
+            echo "::error::tag is $TAG but Cargo.toml says $toml — bump the version and re-tag"
+            exit 1
+          fi
+          # cargo test runs with --locked, so a lockfile left behind by the
+          # version bump would otherwise fail later with a cryptic error.
+          lock=$(awk '/^name = "lakeview"$/{getline; print}' Cargo.lock | cut -d'"' -f2)
+          if [ "$lock" != "$VERSION" ]; then
+            echo "::error::Cargo.lock still says $lock — run cargo check and commit Cargo.lock"
+            exit 1
+          fi
+      - run: cargo test --locked
+
+  build:
+    name: ${{ matrix.asset }}
+    needs: [resolve, test]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux is built against musl so the binaries are static and run on
+          # any distro regardless of its glibc version. Do not install
+          # musl-tools and point the linker at musl-gcc: Ubuntu's musl-gcc
+          # specs produce a static-PIE that segfaults on startup on x86_64.
+          # rustc's bundled musl and self-contained linking work as they are.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            asset: linux_amd64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: linux_arm64
+          # macOS is Apple silicon only.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: darwin_arm64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      # reqwest's rustls pulls in aws-lc-sys, which is C and builds with cmake.
+      # The runner images ship one, so this only says so out loud — a runner
+      # that ever stops doing should fail here rather than deep in a build log.
+      - name: Check cmake is available
+        run: cmake --version
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke test the built binary
+        # Every target is built natively, so the binary runs here. --version
+        # exits before lakeview reads a config or looks for a terminal, so this
+        # works with output redirected into the log.
+        run: |
+          got=$("target/${{ matrix.target }}/release/lakeview" --version)
+          [ "$got" = "lakeview ${{ needs.resolve.outputs.version }}" ] \
+            || { echo "::error::--version printed '$got'"; exit 1; }
+
+      - name: Package
+        id: pkg
+        run: |
+          name="lakeview_${{ needs.resolve.outputs.version }}_${{ matrix.asset }}.tar.gz"
+          staging=$(mktemp -d)
+          cp "target/${{ matrix.target }}/release/lakeview" \
+             README.md lakeview.example.toml "$staging/"
+          tar -czf "$name" -C "$staging" lakeview README.md lakeview.example.toml
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ steps.pkg.outputs.name }}
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz | tee checksums.txt
+
+      - name: Upload to the release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          # A freshly pushed tag has no release yet, and `gh release upload`
+          # refuses to create one, so make it here if it is missing.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "release $TAG already exists"
+          else
+            gh release create "$TAG" --repo "$REPO" \
+              --title "lakeview ${{ needs.resolve.outputs.version }}" \
+              --generate-notes
+          fi
+          gh release upload "$TAG" *.tar.gz checksums.txt --clobber --repo "$REPO"
+
+      # The tap formula is maintained by hand, so print the values it needs.
+      - name: Formula values
+        working-directory: dist
+        run: |
+          v="${{ needs.resolve.outputs.version }}"
+          {
+            echo "### jeril-divyam/homebrew-tap values for \`lakeview\` $v"
+            echo
+            echo '```ruby'
+            echo "  version \"$v\""
+            for asset in darwin_arm64 linux_amd64 linux_arm64; do
+              f="lakeview_${v}_${asset}.tar.gz"
+              echo "  # $asset"
+              echo "  url \"https://github.com/${{ github.repository }}/releases/download/${{ needs.resolve.outputs.tag }}/$f\""
+              echo "  sha256 \"$(sha256sum "$f" | cut -d' ' -f1)\""
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
