@@ -501,8 +501,9 @@ pub trait Folding {
     fn set_cursor(&mut self, row: usize);
     /// Unfold or fold whatever `row` heads, and select it.
     fn toggle_row(&mut self, row: usize);
-    /// `←` — fold what is open, else step out. `false` once nothing is left to
-    /// close, which is the caller's cue to leave the zoom.
+    /// `←` — fold what is open, else step out. `false` once the cursor is at the
+    /// document's own level with nothing left to close. Winding a document shut
+    /// is as far as `←` goes: leaving the zoom is `Esc`'s.
     fn back(&mut self) -> bool;
 
     /// Unfold everything to `depth` levels and fold whatever is deeper, so the
@@ -657,8 +658,8 @@ impl Folding for JsonDoc {
         }
 
         // Nothing to close here, so step out to the block this row sits in. At
-        // the document's own level there is no such block, and the zoom gives
-        // way — the root brackets being unfoldable, that is the end of the line.
+        // the document's own level there is no such block, and the root brackets
+        // being unfoldable, that is as far as `←` reaches.
         let Some(path) = row.parent.clone() else {
             return false;
         };
@@ -1035,7 +1036,7 @@ impl Folding for Doc {
         };
         let entry = row.entry;
 
-        // The record itself: fold it up, or — already folded — give way.
+        // The record itself: fold it up, or — already folded — stop here.
         if row.sub == 0 {
             if !self.entries[entry].expanded {
                 return false;

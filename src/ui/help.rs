@@ -11,7 +11,8 @@ use crate::theme::Theme;
 const NAVIGATION: &[(&str, &str)] = &[
     ("j / ↓", "move down"),
     ("k / ↑", "move up"),
-    ("l / → / Enter", "expand / step right"),
+    ("l / →", "expand / step right"),
+    ("Enter", "open a file full-screen"),
     ("h / ← / Bksp", "collapse / step left"),
     ("space", "expand / collapse in place"),
     ("g / G", "first / last entry"),
@@ -33,8 +34,8 @@ const ACTIONS: &[(&str, &str)] = &[
 
 const ABOUT: &str = "Three panes: repositories, the object tree of one ref, and a \
 detail/preview pane. Selecting a repository opens its default branch; → expands it to pick \
-another branch or tag. In the tree → and ← open and close directories, → on a file zooms its \
-preview full-screen, where long lines wrap; the side pane lets them overflow. At a pane's edge → \
+another branch or tag. In the tree → and ← open and close directories, Enter on a file zooms its \
+preview full-screen — Esc leaves it — where long lines wrap; the side pane lets them overflow. At a pane's edge → \
 and ← move focus instead. / in the tree searches recursively, \
 walking into closed directories and opening the path to every match; Esc restores the shape \
 you had open. Set ui.mouse = false to hand the mouse back to your terminal.";
@@ -43,8 +44,8 @@ const FOLDING: &str = "A zoomed .json opens unfolded all the way down, the whole
 zoomed .jsonl starts folded instead, listing its records a row apiece. \
 →, Enter or space unfolds the selected row a level at a time; \
 space folds it back up too, from its opening row or its closing bracket either way. ← winds back out, \
-folding what is open and stepping out of what is not, and leaves the zoom only once nothing is \
-left to close; Esc leaves at once. Folded rows are truncated — unfolding is how you see the rest \
+folding what is open and stepping out of what is not, and does nothing once nothing is left to \
+close; Esc is what leaves the zoom. Folded rows are truncated — unfolding is how you see the rest \
 — and everything else wraps. a on a folded row unfolds the whole document, all the way down; on \
 an open one it brings every record to the level that row is open to. c folds all of it back up. A \
 zoomed .json has nothing to level itself against, so a opens all of it and c shuts it to its own \

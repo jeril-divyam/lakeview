@@ -20,7 +20,7 @@ configurable ratio.
 │ ● analytics    main││ ▸ images/               ││  5     "a",                 │
 │                    ││   README.md       120 B ││  6     "b"                  │
 ╰────────────────────╯╰─────────────────────────╯╰─────────────────────────────╯
-    ↑↓/jk move  →/l open  ←/h back  space toggle  / search  d download  q quit
+    ↑↓/jk move  →/l expand  ⏎ open  ←/h back  space toggle  / search  q quit
 ```
 
 Selecting a repository opens its default branch straight away — the listing
@@ -103,12 +103,14 @@ secrets need not be stored on disk. `lakeview init` writes the file with mode
 | Key | Action |
 |---|---|
 | `j` `k` / `↓` `↑` | move |
-| `l` `→` `Enter` | expand; at a pane's edge, move focus right; on a file, zoom the preview; in a zoomed `.json` or `.jsonl`, unfold a row |
-| `h` `←` `Backspace` | collapse, else go to the parent; at the top level, move focus left, or leave a zoom |
+| `l` `→` | expand; at a pane's edge, move focus right; in a zoomed `.json` or `.jsonl`, unfold a row |
+| `Enter` | everything `→` does, and on a file it zooms the preview full-screen |
+| `h` `←` `Backspace` | collapse, else go to the parent; at the top level, move focus left; in a zoom, fold back up |
+| `Esc` | leave a zoom, or clear the search |
 | `space` | expand / collapse in place, without moving focus |
 | `g` / `G` | first / last entry |
 | `Ctrl-d` / `Ctrl-u` | half-page down / up |
-| `/` | search the focused pane (`Esc` clears) |
+| `/` | search the focused pane |
 | `a` / `c` | in a zoom, unfold it all — or to the level you are reading at / fold it all back up |
 | `F` | in a zoomed `.jsonl`, filter which keys the records show |
 | `d` | download the selected file into the working directory |
@@ -151,7 +153,7 @@ thing, so a directory says so rather than quietly doing nothing.
 
 ## JSON
 
-Zooming a `.json` file (`→` on it in the tree) opens it unfolded all the way
+Zooming a `.json` file (`Enter` on it in the tree) opens it unfolded all the way
 down: every object and array inside it on show, marked `▾`. A file is one value,
 and reading it is reading the whole of it — `c` folds it back to the root's own
 members when the shape is what you are after.
@@ -180,9 +182,9 @@ members when the shape is what you are after.
 `→`, `Enter` or `space` unfolds the selected row a level at a time. `space` folds
 it back up as well, from its opening row or its closing bracket either way; `→`
 only ever opens, so pressing it on something already open leaves it alone. `←`
-winds back out the way it does in the tree, and leaves the zoom once nothing is
-left to close. The file's own brackets don't fold — collapsing a whole file to `{…}`
-says nothing.
+winds back out the way it does in the tree, and stops once nothing is left to
+close; `Esc` leaves the zoom. The file's own brackets don't fold — collapsing a
+whole file to `{…}` says nothing.
 
 Line numbers count the rows on show, so folding a block renumbers what is under
 it. The document is re-indented from the parsed value, so there is no original
@@ -196,7 +198,7 @@ still reads down the pane.
 
 ## JSONL
 
-Zooming a `.jsonl` or `.ndjson` file (`→` on it in the tree) gives every record
+Zooming a `.jsonl` or `.ndjson` file (`Enter` on it in the tree) gives every record
 a row of its own, folded onto one line. `→`, `Enter` or `space` unfolds the
 selected record to its top level; the objects and arrays inside it stay folded
 on a row each, marked `▸`, and unfold a level at a time in turn:
@@ -222,8 +224,9 @@ way, and what was open inside it is remembered. `→` and `Enter` only unfold �
 descending is one direction, as it is in the tree.
 
 `←` winds back out the way it does in the tree: it folds what is open, steps out
-to the enclosing block when there is nothing there to fold, and only once the
-whole record is folded again does it leave the zoom. `Esc` leaves at once.
+to the enclosing block when there is nothing there to fold, and stops once the
+whole record is folded again. Leaving the zoom is `Esc`'s alone — a key you hold
+down to fold your way up a record should not be able to lose you the file.
 
 ### All at once
 

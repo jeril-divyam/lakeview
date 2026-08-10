@@ -322,9 +322,17 @@ fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
         KeyCode::Char('g') | KeyCode::Home => app.select_edge(true),
         KeyCode::Char('G') | KeyCode::End => app.select_edge(false),
 
-        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+        KeyCode::Char('l') | KeyCode::Right => {
             if app.tab == Tab::Browse {
                 app.open();
+            }
+        }
+        // Everything `→` does, plus the one thing only it does: open a file
+        // full-screen. `Esc` is the way back out of that, so the key that walks
+        // the tree must not stumble into it.
+        KeyCode::Enter => {
+            if app.tab == Tab::Browse {
+                app.enter();
             }
         }
         KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {

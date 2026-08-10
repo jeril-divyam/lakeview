@@ -219,10 +219,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("Esc", "leave"),
             ("d", "download"),
         ],
-        (_, Mode::Zoom) => &[("↑↓/jk", "scroll"), ("Esc/h", "back"), ("d", "download")],
+        (_, Mode::Zoom) => &[("↑↓/jk", "scroll"), ("Esc", "back"), ("d", "download")],
         (Tab::Browse, _) => &[
             ("↑↓/jk", "move"),
-            ("→/l", "open"),
+            ("→/l", "expand"),
+            ("⏎", "open"),
             ("←/h", "back"),
             ("space", "toggle"),
             ("/", "search"),

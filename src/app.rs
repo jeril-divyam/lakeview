@@ -1752,8 +1752,13 @@ impl App {
                     return;
                 };
                 if !self.tree.nodes[slot].is_dir() {
-                    self.mode = Mode::Zoom;
-                    self.preview.scroll = 0;
+                    // A file has no level to step into, and filling the screen
+                    // with it is a bigger step than `→` takes anywhere else, so
+                    // it belongs to `Enter` alone — see [`App::enter`]. Said
+                    // rather than done quietly: the key you walked the tree down
+                    // with stopping without a word reads like a broken row.
+                    let name = self.tree.nodes[slot].name.clone();
+                    self.set_status(format!("⏎ opens {name}"), false);
                     return;
                 }
                 self.tree.nodes[slot].expanded = true;
@@ -1767,17 +1772,35 @@ impl App {
         }
     }
 
+    /// `⏎` — the same descent as `→` everywhere except on a file, which it and
+    /// it alone opens full-screen.
+    ///
+    /// Zooming is not a step of the same size as the others: it replaces the
+    /// three panes with one file, and `Esc` is the only way back out. A key held
+    /// down to walk the tree should not fall into that at the first leaf it
+    /// meets, so the deliberate key gets it and `→` stays a tree movement.
+    pub fn enter(&mut self) {
+        if !self.zoomed()
+            && self.focus == Focus::Tree
+            && self.tree.selected().is_some_and(|n| !n.is_dir())
+        {
+            self.mode = Mode::Zoom;
+            self.preview.scroll = 0;
+            return;
+        }
+        self.open();
+    }
+
     /// `←` — ascend: collapse, step to the parent, or move focus left.
     pub fn back(&mut self) {
         if self.zoomed() {
-            // A zoomed JSONL folds its way out a level at a time; the zoom is
-            // only what `←` leaves once nothing is left open.
-            if let Some(doc) = self.zoom_doc_mut()
-                && doc.back()
-            {
-                return;
+            // A zoomed document folds its way back up a level at a time. Once
+            // nothing is left open there is nothing here to do: leaving is
+            // `Esc`'s alone, so winding a file all the way closed doesn't also
+            // throw away the file you were reading.
+            if let Some(doc) = self.zoom_doc_mut() {
+                doc.back();
             }
-            self.mode = Mode::Normal;
             return;
         }
         match self.focus {
@@ -2357,7 +2380,9 @@ impl App {
             if expandable {
                 self.toggle();
             } else {
-                self.open();
+                // `enter` rather than `open`: a double-click is the deliberate
+                // gesture, so it is `⏎`'s counterpart and zooms a file.
+                self.enter();
             }
         }
     }
@@ -2893,5 +2918,113 @@ mod tests {
         pending.load = Load::Loading;
         assert!(row_expandable(&pending));
         assert!(!row_expandable(&slot(vec![branch("main", true)])));
+    }
+
+    // ── the zoom is `⏎`'s to enter and `Esc`'s to leave ───────────────────
+
+    fn test_app() -> App {
+        let profile = Profile {
+            // Nothing here is fetched; the client only has to exist.
+            endpoint: "http://127.0.0.1:1".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+            default_repo: None,
+            default_ref: None,
+            verify_tls: true,
+            timeout_secs: 1,
+            description: None,
+        };
+        let client = Client::new(&profile, 500).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(Config::default(), "test".into(), profile, client, tx)
+    }
+
+    fn stat(path: &str, dir: bool) -> ObjectStats {
+        ObjectStats {
+            path: path.into(),
+            path_type: if dir { "common_prefix" } else { "object" }.into(),
+            size_bytes: (!dir).then_some(12),
+        }
+    }
+
+    /// A tree of one directory and one file, focused, with the file selected.
+    fn app_on_a_file() -> App {
+        let mut app = test_app();
+        app.tree.key = Some(("repo".into(), "main".into()));
+        app.on_msg(Msg::Children {
+            generation: app.tree.generation,
+            prefix: String::new(),
+            res: Ok(vec![stat("data/", true), stat("notes.txt", false)]),
+        });
+        app.focus = Focus::Tree;
+        // Directories sort first, so the file is the second row.
+        app.tree.state.select(Some(1));
+        assert!(app.tree.selected().is_some_and(|n| !n.is_dir()));
+        app.status = None;
+        app
+    }
+
+    /// `→` walks the tree and stops at a file. It used to fill the screen with
+    /// it, which a key you hold down should not be able to do.
+    #[tokio::test]
+    async fn right_on_a_file_does_not_zoom() {
+        let mut app = app_on_a_file();
+        app.open();
+        assert_eq!(app.mode, Mode::Normal, "`→` opened the zoom");
+        // And it names the key that does, rather than reading as a dead row.
+        let status = app.status.as_ref().expect("`→` on a file said nothing");
+        assert!(status.text.contains("notes.txt"), "{}", status.text);
+        assert!(!status.is_error, "declining to zoom is not a failure");
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_file_zooms_it() {
+        let mut app = app_on_a_file();
+        app.preview.scroll = 7;
+        app.enter();
+        assert_eq!(app.mode, Mode::Zoom);
+        assert_eq!(app.preview.scroll, 0, "the zoom opens at the top");
+    }
+
+    /// Everywhere but a file, `⏎` is `→`: a directory opens rather than zooming.
+    #[tokio::test]
+    async fn enter_on_a_directory_descends_like_right() {
+        let mut app = app_on_a_file();
+        app.tree.state.select(Some(0));
+        app.enter();
+        assert_eq!(app.mode, Mode::Normal, "a directory is not a file");
+        assert!(app.tree.nodes[app.tree.rows[0]].expanded);
+    }
+
+    /// `←` winds a document shut and then stops. Folding the last block used to
+    /// drop out of the zoom along with it, so a held `h` could lose you the file
+    /// you were reading.
+    #[tokio::test]
+    async fn left_in_a_zoom_folds_but_never_leaves() {
+        let mut app = app_on_a_file();
+        let value: serde_json::Value = serde_json::from_str(r#"{"a":{"b":1}}"#).unwrap();
+        let mut doc = crate::jsonl::JsonDoc::new(value);
+        // Resting inside `"a"`, so `←` has somewhere to wind out of.
+        doc.cursor = 2;
+        app.preview.body = Some(PreviewBody::Json {
+            lines: Vec::new(),
+            doc,
+        });
+        app.enter();
+        assert_eq!(app.mode, Mode::Zoom);
+        let open = app.zoom_doc().unwrap().rows_len();
+
+        // Out to `"a"`, which folds; after that there is nowhere left to go, and
+        // none of the presses leaves.
+        for _ in 0..5 {
+            app.back();
+            assert_eq!(app.mode, Mode::Zoom, "`←` left the zoom");
+        }
+        let shut = app.zoom_doc().unwrap().rows_len();
+        assert!(shut < open, "`←` folded nothing: {shut} of {open} rows");
+
+        // `Esc` is the way out — see `on_key_normal`, which owns that key.
+        app.mode = Mode::Normal;
+        assert!(!app.zoomed());
     }
 }
