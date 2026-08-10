@@ -748,7 +748,11 @@ fn wrap_line(line: Line<'static>, width: usize, indent: usize) -> Vec<Line<'stat
             start += 1;
         }
     }
-    out
+    // The cells carry only what their own spans set, so a line styled as a whole
+    // — `Line::styled(text, style)`, one bare span under a line-level style —
+    // would come back out of here uncoloured. Hand that style to every piece.
+    let style = line.style;
+    out.into_iter().map(|line| line.style(style)).collect()
 }
 
 fn char_width(c: char) -> usize {
@@ -1030,6 +1034,18 @@ mod tests {
             for span in l.spans.iter().filter(|s| s.content.contains('x')) {
                 assert_eq!(span.style, keyed);
             }
+        }
+    }
+
+    #[test]
+    fn a_style_on_the_whole_line_survives_the_break() {
+        // The detail pane writes its own lines this way — one bare span under a
+        // line-level style — rather than styling each span.
+        let line = Line::styled("x".repeat(40), Theme::file());
+        let out = wrap_line(line, 20, 0);
+        assert!(out.len() > 1);
+        for piece in &out {
+            assert_eq!(piece.style.fg, Some(Theme::FG));
         }
     }
 
