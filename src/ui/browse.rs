@@ -9,7 +9,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, HighlightSpacing, List, ListItem, Padding, Paragraph, Wrap,
 };
 
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{format_ts, human_size, justify, truncate};
 use crate::app::{
@@ -884,7 +884,11 @@ fn wrap_line(line: Line<'static>, width: usize, indent: usize) -> Vec<Line<'stat
 }
 
 fn char_width(c: char) -> usize {
-    UnicodeWidthStr::width(c.to_string().as_str())
+    // Per-char, not per-`String`: this runs over every character of every line
+    // of every frame, and the allocation was the whole cost. `width` is `None`
+    // exactly where the string form measures zero — control characters — so the
+    // fallback keeps the old answer.
+    c.width().unwrap_or(0)
 }
 
 /// Rebuild a line from styled cells, merging runs that share a style back into

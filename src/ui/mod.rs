@@ -18,7 +18,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Mode, Tab};
 use crate::theme::Theme;
@@ -300,7 +300,7 @@ pub fn truncate(s: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for ch in s.chars() {
-        let w = UnicodeWidthStr::width(ch.to_string().as_str());
+        let w = ch.width().unwrap_or(0);
         if used + w > width - 1 {
             break;
         }
