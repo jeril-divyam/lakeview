@@ -1,1 +1,5 @@
 target
+
+# Notes and scratch write-ups stay local; the README is the only tracked prose.
+*.md
+!README.md
