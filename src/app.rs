@@ -979,9 +979,20 @@ impl App {
         );
         self.inflight += 1;
         let show_tags = self.cfg.ui.show_tags;
+        // The listing we expanded from already knows the default branch.
+        let default_branch = self
+            .repos
+            .repos
+            .iter()
+            .find(|r| r.id == repo)
+            .map(|r| r.default_branch.clone())
+            .unwrap_or_default();
         let (tx, client, repo) = (self.tx.clone(), self.client.clone(), repo.to_string());
         tokio::spawn(async move {
-            let res = client.refs(&repo, show_tags).await.map_err(fmt_err);
+            let res = client
+                .refs(&repo, &default_branch, show_tags)
+                .await
+                .map_err(fmt_err);
             let _ = tx.send(Msg::Refs { req, repo, res });
         });
     }

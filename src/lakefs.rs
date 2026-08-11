@@ -273,13 +273,17 @@ impl Client {
     }
 
     /// Branches first (default branch pinned to the top), then tags.
-    pub async fn refs(&self, repo: &str, include_tags: bool) -> Result<Vec<NamedRef>> {
-        let default_branch = self
-            .repository(repo)
-            .await
-            .map(|r| r.default_branch)
-            .unwrap_or_default();
-
+    ///
+    /// `default_branch` is passed in rather than fetched: the repository listing
+    /// the caller expanded from already carries it, and asking for it again is a
+    /// round-trip per expansion for something in hand. An empty string pins
+    /// nothing, which is what a repository we have no listing for should do.
+    pub async fn refs(
+        &self,
+        repo: &str,
+        default_branch: &str,
+        include_tags: bool,
+    ) -> Result<Vec<NamedRef>> {
         let branches: Vec<RefEntry> = self
             .paged(
                 &format!("/repositories/{}/branches", enc(repo)),
@@ -320,16 +324,6 @@ impl Client {
             }
         }
         Ok(out)
-    }
-
-    pub async fn repository(&self, repo: &str) -> Result<Repository> {
-        let resp = self
-            .get(&format!("/repositories/{}", enc(repo)))
-            .send()
-            .await
-            .context("fetching repository")?;
-        let resp = Self::check(resp, "fetching repository").await?;
-        resp.json().await.context("parsing repository")
     }
 
     /// One directory level: `delimiter=/` collapses deeper keys into prefixes.
