@@ -10,7 +10,7 @@ default_profile = "local"
 repos_width = 28           # columns for the repositories pane; 0 folds it to its marks
 tree_ratio = 1             # the tree and the preview divide the remaining width
 preview_ratio = 1          # by these ratios; preview_ratio = 0 hides the pane
-preview_bytes = 4000000    # max bytes fetched when previewing a file
+preview_bytes = 1000000    # max bytes fetched when previewing a file
 page_size = 500            # entries fetched per API request (lakeFS caps at 1000)
 search_max_requests = 300  # listings a recursive `/` search may spend
 show_tags = true           # list tags alongside branches
