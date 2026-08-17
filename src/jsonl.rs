@@ -535,6 +535,17 @@ pub trait Folding {
         self.set_cursor(next);
     }
 
+    /// Pull the cursor back inside the document after a fold, a filter edit or
+    /// a restore changed how many rows are on show. Asking is not free —
+    /// `rows_len` rebuilds the rows — so shape changes call this once, at the
+    /// end.
+    fn clamp_cursor(&mut self) {
+        let last = self.rows_len().saturating_sub(1);
+        if self.cursor() > last {
+            self.set_cursor(last);
+        }
+    }
+
     fn select_edge(&mut self, first: bool) {
         let row = if first {
             0
@@ -606,7 +617,7 @@ impl JsonDoc {
     /// anyway rather than misbehaving.
     pub fn restore(&mut self, open: Open) {
         self.open = open;
-        self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
+        self.clamp_cursor();
     }
 }
 
@@ -643,14 +654,14 @@ impl Folding for JsonDoc {
             self.cursor = opening;
         }
         self.open.toggle(&path);
-        self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
+        self.clamp_cursor();
     }
 
     /// The root brackets don't fold, so the file's shallowest level is 1 and a
     /// `depth` of 0 means the same thing.
     fn expand_to(&mut self, depth: usize) {
         self.open = opened_to(&self.value, depth);
-        self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
+        self.clamp_cursor();
     }
 
     /// A file is one value, not a shape repeated, so there is nothing to level
@@ -879,7 +890,7 @@ impl Doc {
                 _ => None,
             };
         }
-        self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
+        self.clamp_cursor();
     }
 
     /// How deep record `entry` is unfolded: `0` when it is folded onto its own
@@ -903,9 +914,12 @@ impl Doc {
                 .iter()
                 .position(|r| r.entry == entry && r.sub == 0)
         });
-        self.cursor = row
-            .unwrap_or(self.cursor)
-            .min(self.rows_len().saturating_sub(1));
+        match row {
+            // A position in the rows just built is in range by construction,
+            // so it needs no clamp — and the clamp's rebuild is not free.
+            Some(row) => self.cursor = row,
+            None => self.clamp_cursor(),
+        }
     }
 
     /// Unfold or fold a key in the menu, reporting whether anything moved. Kept
@@ -1002,7 +1016,7 @@ impl Folding for Doc {
             }
             self.entries[entry].open.toggle(&path);
         }
-        self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
+        self.clamp_cursor();
     }
 
     /// Every record to the same level: `depth` of 0 folds them all onto their
@@ -1056,7 +1070,7 @@ impl Folding for Doc {
                 return false;
             }
             self.entries[entry].expanded = false;
-            self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
+            self.clamp_cursor();
             return true;
         }
 
