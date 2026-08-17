@@ -318,8 +318,10 @@ fn on_key_keys(app: &mut App, key: KeyEvent) {
 fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
+        // Out of the zoom, out of the preview, or clear the search — one step
+        // per press, outermost first.
         KeyCode::Esc => {
-            if !app.leave_zoom() && !app.filter().is_empty() {
+            if !app.leave_zoom() && !app.leave_preview() && !app.filter().is_empty() {
                 app.filter_clear();
             }
         }
@@ -356,11 +358,11 @@ fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
                 app.back();
             }
         }
-        // `←`'s twin in the tree, but in a zoom it means what `Esc` means: out.
-        // Unlike `←` it is not a key you hold down to fold your way up a record,
-        // so leaving on it cannot cost you the file you were reading.
+        // `←`'s twin in the tree, but in a zoom or the preview it means what
+        // `Esc` means: out. Unlike `←` it is not a key you hold down to fold your
+        // way up a record, so it leaves in one press rather than folding first.
         KeyCode::Backspace => {
-            if !app.leave_zoom() && app.tab == Tab::Browse {
+            if !app.leave_zoom() && !app.leave_preview() && app.tab == Tab::Browse {
                 app.back();
             }
         }
@@ -374,7 +376,7 @@ fn on_key_normal(app: &mut App, key: KeyEvent, ctrl: bool) {
 
         KeyCode::Char('/') => {
             if app.tab == Tab::Browse {
-                app.mode = Mode::Filter;
+                app.start_filter();
             }
         }
         KeyCode::Char('r') => match app.tab {

@@ -36,7 +36,7 @@ pub enum Seg {
 /// Which containers inside one record are unfolded, as a tree mirroring the
 /// value's shape. A child that is missing — or present but not `open` — renders
 /// folded, so a record that has just been expanded shows only its top level.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Open {
     open: bool,
     children: HashMap<Seg, Open>,
@@ -593,6 +593,20 @@ impl JsonDoc {
         let mut out = Vec::new();
         write_body(&mut out, &self.value, &self.open);
         out
+    }
+
+    /// The fold shape, to be put back on a later visit to the same object.
+    pub fn folds(&self) -> Open {
+        self.open.clone()
+    }
+
+    /// Adopt a fold shape kept from an earlier visit. The tree is only ever
+    /// consulted by path, so segments naming keys this value no longer has are
+    /// simply never looked up — a changed object opens the way it would have
+    /// anyway rather than misbehaving.
+    pub fn restore(&mut self, open: Open) {
+        self.open = open;
+        self.cursor = self.cursor.min(self.rows_len().saturating_sub(1));
     }
 }
 

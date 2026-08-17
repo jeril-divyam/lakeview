@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Mode, Tab};
+use crate::app::{App, Focus, Mode, Tab};
 use crate::theme::Theme;
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -216,7 +216,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         ],
         // A zoomed JSON file has rows to fold; anything else zoomed is a flat
         // body, where the same keys only move the view.
-        (_, Mode::Zoom) if app.zoom_doc().is_some() => &[
+        (_, Mode::Zoom) if app.focused_doc().is_some() => &[
             ("↑↓/jk", "move"),
             ("→/space", "unfold"),
             ("←/h", "fold"),
@@ -225,6 +225,17 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("d", "download"),
         ],
         (_, Mode::Zoom) => &[("↑↓/jk", "scroll"), ("Esc", "back"), ("d", "download")],
+        // The cursor has stepped into the preview, so the keys mean what they
+        // mean in the zoom — bar `←`, which folds its way back out to the tree.
+        (Tab::Browse, _) if app.focus == Focus::Preview => &[
+            ("↑↓/jk", "move"),
+            ("→/space", "unfold"),
+            ("←/h", "fold / back"),
+            ("a/c", "all"),
+            ("⏎", "zoom"),
+            ("Esc", "tree"),
+            ("d", "download"),
+        ],
         (Tab::Browse, _) => &[
             ("↑↓/jk", "move"),
             ("→/l", "expand"),

@@ -109,6 +109,11 @@ pub enum RowKind {
 pub enum Focus {
     Repos,
     Tree,
+    /// The preview, reading a `.json`. Unlike the other two this is not a list
+    /// of rows to select but a document to fold, and `→` only steps into it when
+    /// there is one — a `.jsonl`, a text file or a hex dump has nothing here for
+    /// the cursor to do, and stays the tree's to scroll.
+    Preview,
 }
 
 fn move_in(state: &mut ListState, len: usize, delta: isize) {
@@ -539,23 +544,16 @@ pub struct Preview {
 
 pub enum PreviewBody {
     Text(Vec<String>),
-    /// Re-indented JSON, tokenised so the UI can colour it.
-    ///
-    /// Two renderings of one value: `lines` is the whole thing laid flat, which
-    /// is all the side pane has room to say, and `doc` folds. Built once here
-    /// rather than per frame, and bounded by `preview_bytes` either way.
-    Json {
-        lines: Vec<JsonLine>,
-        doc: crate::jsonl::JsonDoc,
-    },
+    /// Re-indented JSON, tokenised so the UI can colour it, and foldable a level
+    /// at a time. Both the side pane and the zoom render this one document, so
+    /// what you fold in either is folded in the other. Parsed once here rather
+    /// than per frame, and bounded by `preview_bytes`.
+    Json(crate::jsonl::JsonDoc),
     /// Newline-delimited JSON, one foldable record per row. The side pane still
     /// renders it as plain text; only the zoom unfolds it.
     Jsonl(crate::jsonl::Doc),
     Binary(Vec<String>),
 }
-
-/// One rendered line of JSON as a run of (token kind, text) pairs.
-pub type JsonLine = Vec<(JsonTok, String)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonTok {
@@ -675,8 +673,10 @@ pub struct Hits {
     pub tree: Option<Rect>,
     /// Inner area of the detail/preview pane.
     pub preview: Option<Rect>,
-    /// For a zoomed JSONL preview, the row each screen line of that area shows.
-    /// A row that wrapped occupies several entries.
+    /// When the preview drew a foldable document — a zoom of either kind, or a
+    /// `.json` in the side pane — the row each screen line of that area shows.
+    /// A row that wrapped occupies several entries. Cleared at the top of every
+    /// browse frame, so a frame that draws no rows leaves nothing to click on.
     pub preview_rows: Vec<usize>,
     /// For the same preview, the line each row of the whole document starts at.
     /// The layout is the only account of how tall a row came out, and paging
@@ -778,7 +778,18 @@ pub struct App {
     /// where it was rather than at a default. Held for the session only: the file
     /// records that the pane is folded, which is the part worth keeping.
     repos_restore: u16,
+    /// Fold shapes of the `.json` objects visited this session, keyed the way the
+    /// preview is, oldest first. A preview lasts only as long as the selection
+    /// sits on it, so without this every fold would be undone by a glance at the
+    /// file next door. Trimmed from the front past [`FOLD_MEMORY`]: a long browse
+    /// must not grow without bound, and an object folded thirty files back is not
+    /// worth the room.
+    folds: Vec<((String, String, String), crate::jsonl::Open)>,
 }
+
+/// How many objects' fold shapes are kept. Comfortably more than anyone flips
+/// between while reading, and small enough that the whole lot is a linear scan.
+const FOLD_MEMORY: usize = 64;
 
 impl App {
     pub fn new(
@@ -819,6 +830,7 @@ impl App {
             last_click: None,
             drag: None,
             repos_restore,
+            folds: Vec::new(),
         };
         app.load_repos();
         if let Some(warning) = app.cfg.warnings.first().cloned() {
@@ -862,7 +874,7 @@ impl App {
 
     /// The zoomed JSONL document, when that is what is on screen. The
     /// `truncated` mark and the key filter are particular to it; folding goes
-    /// through `zoom_doc`.
+    /// through `focused_doc`.
     pub fn jsonl(&self) -> Option<&crate::jsonl::Doc> {
         match (self.zoomed(), &self.preview.body) {
             (true, Some(PreviewBody::Jsonl(doc))) => Some(doc),
@@ -877,32 +889,68 @@ impl App {
         }
     }
 
-    /// The foldable document the zoom is showing, of either kind.
+    /// Whether the keys are driving a foldable document rather than a list of
+    /// rows: the zoom, or the preview pane holding a `.json`.
     ///
-    /// Folding is a zoom-only affair. The side pane is too narrow to read a
-    /// folded row in — a JSON file gets its flat pretty-print there, and JSONL
-    /// the plain lines it is.
-    pub fn zoom_doc(&self) -> Option<&dyn Folding> {
-        match (self.zoomed(), &self.preview.body) {
-            (true, Some(PreviewBody::Jsonl(doc))) => Some(doc),
-            (true, Some(PreviewBody::Json { doc, .. })) => Some(doc),
+    /// The focus outlives a change of tab — come back to Browse and the cursor
+    /// is where you left it — so the tab is part of the question. Otherwise `a`
+    /// or `G` on the commit log would fold a file nobody can see.
+    pub fn driving_doc(&self) -> bool {
+        self.tab == Tab::Browse && (self.zoomed() || self.focus == Focus::Preview)
+    }
+
+    /// The foldable document the keys are driving, of either kind.
+    ///
+    /// Zoomed, that is whatever is on screen. In the three-pane layout it is the
+    /// preview once `→` has stepped into it, and then only a `.json`: a `.jsonl`
+    /// record is too much to read at that width, so beside the tree it stays the
+    /// flat line it is and folds in the zoom alone.
+    pub fn focused_doc(&self) -> Option<&dyn Folding> {
+        if !self.driving_doc() {
+            return None;
+        }
+        match (&self.preview.body, self.zoomed()) {
+            (Some(PreviewBody::Jsonl(doc)), true) => Some(doc),
+            (Some(PreviewBody::Json(doc)), _) => Some(doc),
             _ => None,
         }
     }
 
-    fn zoom_doc_mut(&mut self) -> Option<&mut dyn Folding> {
-        match (self.zoomed(), &mut self.preview.body) {
-            (true, Some(PreviewBody::Jsonl(doc))) => Some(doc),
-            (true, Some(PreviewBody::Json { doc, .. })) => Some(doc),
+    fn focused_doc_mut(&mut self) -> Option<&mut dyn Folding> {
+        if !self.driving_doc() {
+            return None;
+        }
+        let zoomed = self.zoomed();
+        match (&mut self.preview.body, zoomed) {
+            (Some(PreviewBody::Jsonl(doc)), true) => Some(doc),
+            (Some(PreviewBody::Json(doc)), _) => Some(doc),
             _ => None,
         }
     }
 
-    /// The filter belonging to whichever pane has focus.
+    /// The previewed JSON document whatever the focus, which is what the pane
+    /// draws and what the fold memory is taken from.
+    fn json_doc_mut(&mut self) -> Option<&mut crate::jsonl::JsonDoc> {
+        match &mut self.preview.body {
+            Some(PreviewBody::Json(doc)) => Some(doc),
+            _ => None,
+        }
+    }
+
+    /// Whether the preview is holding a `.json` the cursor could step into.
+    pub fn preview_folds(&self) -> bool {
+        !self.preview.loading
+            && self.preview.error.is_none()
+            && matches!(self.preview.body, Some(PreviewBody::Json(_)))
+    }
+
+    /// The filter belonging to whichever pane has focus. The preview searches
+    /// nothing — it is one file, not a list — so it has none.
     pub fn filter(&self) -> &str {
         match self.focus {
             Focus::Repos => &self.repos.filter,
             Focus::Tree => &self.tree.filter,
+            Focus::Preview => "",
         }
     }
 
@@ -1086,6 +1134,15 @@ impl App {
                 self.load_repos();
                 self.set_status("reloading repositories…", false);
             }
+            // In the preview `r` means the object under it, not the tree around
+            // it. Dropping the key is what makes the next poll refetch; the
+            // folds are put away first so the reload comes back as you left it.
+            Focus::Preview => {
+                self.remember_folds();
+                self.preview.key = None;
+                self.mark_preview_dirty();
+                self.set_status("reloading preview…", false);
+            }
             Focus::Tree => {
                 let Some(key) = self.tree.key.clone() else {
                     return;
@@ -1154,10 +1211,12 @@ impl App {
             self.clear_preview();
             return;
         };
-        // Only the tree selects objects; pane one renders its own details.
+        // Only the tree selects objects; pane one renders its own details. The
+        // preview is reading whatever the tree is on, so it holds the selection
+        // still rather than dropping it.
         let object = match self.focus {
             Focus::Repos => None,
-            Focus::Tree => self.tree.selected().map(|n| n.stat.clone()),
+            Focus::Tree | Focus::Preview => self.tree.selected().map(|n| n.stat.clone()),
         };
         let Some(object) = object else {
             self.clear_preview();
@@ -1173,6 +1232,9 @@ impl App {
         if self.preview.key.as_ref() == Some(&key) {
             return;
         }
+        // Past here the old preview is replaced either way, so its folds are put
+        // away while its own key is still the one on record.
+        self.remember_folds();
 
         // A ranged GET on a zero-byte object can come back 416; skip the trip.
         if object.size_bytes == Some(0) {
@@ -1212,7 +1274,42 @@ impl App {
     }
 
     fn clear_preview(&mut self) {
+        self.remember_folds();
         self.preview = Preview::default();
+        // Nothing left in there to read, so the cursor cannot stay in it.
+        self.leave_preview();
+    }
+
+    /// Put the previewed `.json`'s fold shape away before the preview holding it
+    /// goes. Anything else — a `.jsonl`'s records, its key filter, plain text —
+    /// has no shape worth keeping and is left to go with it.
+    fn remember_folds(&mut self) {
+        let (Some(key), Some(PreviewBody::Json(doc))) = (&self.preview.key, &self.preview.body)
+        else {
+            return;
+        };
+        let folds = doc.folds();
+        match self.folds.iter().position(|(k, _)| k == key) {
+            // Re-recorded at the back: what you were just reading is the last
+            // thing worth dropping.
+            Some(i) => {
+                let (key, _) = self.folds.remove(i);
+                self.folds.push((key, folds));
+            }
+            None => self.folds.push((key.clone(), folds)),
+        }
+        let over = self.folds.len().saturating_sub(FOLD_MEMORY);
+        self.folds.drain(..over);
+    }
+
+    /// The fold shape kept for the object the preview is now on, if it has been
+    /// read before. Copied rather than taken, so a body that turns out not to be
+    /// JSON after all doesn't quietly throw the shape away; `remember_folds`
+    /// overwrites the entry when the preview goes.
+    fn recall_folds(&self) -> Option<crate::jsonl::Open> {
+        let key = self.preview.key.as_ref()?;
+        let (_, folds) = self.folds.iter().find(|(k, _)| k == key)?;
+        Some(folds.clone())
     }
 
     // ── recursive search ─────────────────────────────────────────────────
@@ -1507,9 +1604,22 @@ impl App {
                             &payload.bytes,
                             payload.truncated,
                         ));
+                        // Back to the shape it was left in, if this object has
+                        // been read before. A `.json` opens expanded otherwise.
+                        if let Some(folds) = self.recall_folds()
+                            && let Some(doc) = self.json_doc_mut()
+                        {
+                            doc.restore(folds);
+                        }
                         self.preview.stat = Some(payload.stat);
                     }
                     Err(e) => self.preview.error = Some(e),
+                }
+                // A reload can land something with nothing to fold — the object
+                // rewritten as plain text, or an error where the body was. The
+                // cursor has no business staying in a pane it cannot drive.
+                if !self.preview_folds() {
+                    self.leave_preview();
                 }
             }
 
@@ -1664,9 +1774,9 @@ impl App {
                 let len = self.commits.commits.len();
                 move_in(&mut self.commits.state, len, delta);
             }
-            // A zoomed JSONL preview has rows to move between; anything else
-            // zoomed is a flat body, and moves the view itself.
-            _ if self.zoomed() => match self.zoom_doc_mut() {
+            // A foldable document has rows to move between; anything else zoomed
+            // is a flat body, and moves the view itself.
+            _ if self.driving_doc() => match self.focused_doc_mut() {
                 Some(doc) => doc.move_cursor(delta),
                 None => {
                     self.preview.scroll = self
@@ -1687,6 +1797,8 @@ impl App {
                     move_in(&mut self.tree.state, len, delta);
                     self.mark_preview_dirty();
                 }
+                // Taken by the arm above, which is the only way focus is here.
+                Focus::Preview => {}
             },
         }
     }
@@ -1701,7 +1813,10 @@ impl App {
     /// two pages, so a page always starts where a row does — which is the same
     /// row of overlap you would get anywhere else.
     pub fn page(&mut self, down: bool) {
-        let Some(last_row) = self.zoom_doc().map(|doc| doc.rows_len().saturating_sub(1)) else {
+        let Some(last_row) = self
+            .focused_doc()
+            .map(|doc| doc.rows_len().saturating_sub(1))
+        else {
             return;
         };
         // Without a frame to measure there is no page to speak of yet.
@@ -1732,14 +1847,14 @@ impl App {
         let row = row.min(last_row).min(starts.len() - 1);
 
         self.preview.scroll = starts[row].min(u16::MAX as usize) as u16;
-        if let Some(doc) = self.zoom_doc_mut() {
+        if let Some(doc) = self.focused_doc_mut() {
             doc.set_cursor(row);
         }
     }
 
     pub fn select_edge(&mut self, first: bool) {
-        if self.zoomed() {
-            match self.zoom_doc_mut() {
+        if self.driving_doc() {
+            match self.focused_doc_mut() {
                 Some(doc) => doc.select_edge(first),
                 // The render clamps this to the body's real height, which is
                 // the only place the wrapped line count is known.
@@ -1752,7 +1867,8 @@ impl App {
             Tab::Commits => (&mut self.commits.state, self.commits.commits.len()),
             _ => match self.focus {
                 Focus::Repos => (&mut self.repos.state, self.repos.rows.len()),
-                Focus::Tree => (&mut self.tree.state, self.tree.rows.len()),
+                // The preview is taken by the arm above.
+                Focus::Tree | Focus::Preview => (&mut self.tree.state, self.tree.rows.len()),
             },
         };
         if len > 0 {
@@ -1796,17 +1912,19 @@ impl App {
     /// `→` — descend: expand a repository or directory, move focus at the pane
     /// edges, zoom a file.
     pub fn open(&mut self) {
-        // Already zoomed: descending means unfolding the selected row, and there
-        // is nothing else left to open. Unfolding only — `→` on something
+        // Driving a document: descending means unfolding the selected row, and
+        // there is nothing else left to open. Unfolding only — `→` on something
         // already open does nothing, as it does on an open directory in the
         // tree. `←` folds, and `space` toggles.
-        if self.zoomed() {
-            if let Some(doc) = self.zoom_doc_mut() {
+        if self.driving_doc() {
+            if let Some(doc) = self.focused_doc_mut() {
                 doc.expand_cursor();
             }
             return;
         }
         match self.focus {
+            // Taken by `driving_doc` above, which is the only way focus is here.
+            Focus::Preview => {}
             Focus::Repos => {
                 let Some(row) = self.repos.selected_row() else {
                     return;
@@ -1833,11 +1951,18 @@ impl App {
                     return;
                 };
                 if !self.tree.nodes[slot].is_dir() {
-                    // A file has no level to step into, and filling the screen
-                    // with it is a bigger step than `→` takes anywhere else, so
-                    // it belongs to `Enter` alone — see [`App::enter`]. Said
-                    // rather than done quietly: the key you walked the tree down
-                    // with stopping without a word reads like a broken row.
+                    // A `.json` in the preview is a document of its own, so the
+                    // tree's right edge is a step into it — the same move `→`
+                    // makes from pane one into the tree.
+                    if self.preview_folds() {
+                        self.focus = Focus::Preview;
+                        return;
+                    }
+                    // Anything else has no level to step into, and filling the
+                    // screen with it is a bigger step than `→` takes anywhere
+                    // else, so it belongs to `Enter` alone — see [`App::enter`].
+                    // Said rather than done quietly: the key you walked the tree
+                    // down with stopping without a word reads like a broken row.
                     let name = self.tree.nodes[slot].name.clone();
                     self.set_status(format!("⏎ opens {name}"), false);
                     return;
@@ -1861,10 +1986,19 @@ impl App {
     /// down to walk the tree should not fall into that at the first leaf it
     /// meets, so the deliberate key gets it and `→` stays a tree movement.
     pub fn enter(&mut self) {
-        if !self.zoomed()
-            && self.focus == Focus::Tree
-            && self.tree.selected().is_some_and(|n| !n.is_dir())
-        {
+        if self.zoomed() {
+            self.open();
+            return;
+        }
+        // From the tree, on a file. From the preview, whatever it is reading —
+        // the cursor is kept, so the zoom opens on the row you were on and `Esc`
+        // puts you back in the pane you left.
+        let opens = match self.focus {
+            Focus::Tree => self.tree.selected().is_some_and(|n| !n.is_dir()),
+            Focus::Preview => true,
+            Focus::Repos => false,
+        };
+        if opens {
             self.mode = Mode::Zoom;
             self.preview.scroll = 0;
             return;
@@ -1886,6 +2020,17 @@ impl App {
         false
     }
 
+    /// Step out of the preview back to the tree, answering whether the focus was
+    /// there to move. `Esc` and `Backspace`, which leave in one press rather than
+    /// folding their way out the way `←` does.
+    pub fn leave_preview(&mut self) -> bool {
+        if self.focus == Focus::Preview {
+            self.focus = Focus::Tree;
+            return true;
+        }
+        false
+    }
+
     /// `←` — ascend: collapse, step to the parent, or move focus left.
     pub fn back(&mut self) {
         if self.zoomed() {
@@ -1893,12 +2038,22 @@ impl App {
             // nothing is left open there is nothing here to do: leaving is
             // `Esc`'s alone, so winding a file all the way closed doesn't also
             // throw away the file you were reading.
-            if let Some(doc) = self.zoom_doc_mut() {
+            if let Some(doc) = self.focused_doc_mut() {
                 doc.back();
             }
             return;
         }
         match self.focus {
+            // The same ascent every other pane makes: fold what is open, step
+            // out of what is not, and once nothing is left move focus left. The
+            // zoom stops short of that last step because leaving it costs you
+            // the file; here the file is still right there in the pane.
+            Focus::Preview => {
+                let folded = self.focused_doc_mut().is_some_and(|doc| doc.back());
+                if !folded {
+                    self.focus = Focus::Tree;
+                }
+            }
             Focus::Repos => {
                 let Some(row) = self.repos.selected_row() else {
                     return;
@@ -1936,13 +2091,15 @@ impl App {
 
     /// `space` — expand or collapse in place, without moving focus.
     pub fn toggle(&mut self) {
-        if self.zoomed() {
-            if let Some(doc) = self.zoom_doc_mut() {
+        if self.driving_doc() {
+            if let Some(doc) = self.focused_doc_mut() {
                 doc.toggle_cursor();
             }
             return;
         }
         match self.focus {
+            // Not a list of rows, and `driving_doc` above has already had it.
+            Focus::Preview => {}
             Focus::Repos => {
                 let Some(row) = self.repos.selected_row() else {
                     return;
@@ -1981,7 +2138,7 @@ impl App {
     /// A level is otherwise invisible — a row folded at level 2 looks like one
     /// folded at level 5 — so it is worth saying which one you got.
     pub fn expand_all(&mut self) {
-        let Some(doc) = self.zoom_doc_mut() else {
+        let Some(doc) = self.focused_doc_mut() else {
             return;
         };
         match doc.expand_all() {
@@ -1992,7 +2149,7 @@ impl App {
 
     /// `c` — fold the whole zoomed document back up.
     pub fn collapse_all(&mut self) {
-        let Some(doc) = self.zoom_doc_mut() else {
+        let Some(doc) = self.focused_doc_mut() else {
             return;
         };
         doc.collapse_all();
@@ -2011,7 +2168,9 @@ impl App {
             self.set_status("open a repository and ref first", true);
             return;
         };
-        if self.focus != Focus::Tree {
+        // The preview is reading whatever the tree is on, so `d` there means the
+        // same file it does one pane to the left.
+        if !matches!(self.focus, Focus::Tree | Focus::Preview) {
             self.set_status("select a file in the tree to download", true);
             return;
         }
@@ -2280,6 +2439,9 @@ impl App {
         let (state, len) = match focus {
             Focus::Repos => (&self.repos.state, self.repos.rows.len()),
             Focus::Tree => (&self.tree.state, self.tree.rows.len()),
+            // Not a list: its rows come from the layout, through
+            // `hits.preview_rows`, and `pane_at` never names it.
+            Focus::Preview => return None,
         };
         let line = state.offset() + (row - area.y) as usize;
         (line < len).then_some(line)
@@ -2301,7 +2463,7 @@ impl App {
 
         // Zoomed preview, or the preview pane in the normal layout.
         if self.zoomed() || self.hits.preview.is_some_and(|a| Hits::hit(a, col, row)) {
-            if self.zoom_doc().is_some() {
+            if self.focused_doc().is_some() {
                 self.wheel_zoom(down);
                 return;
             }
@@ -2341,13 +2503,15 @@ impl App {
         let len = match focus {
             Focus::Repos => self.repos.rows.len(),
             Focus::Tree => self.tree.rows.len(),
+            // Not a list; the wheel over it goes through `wheel_zoom`.
+            Focus::Preview => return,
         };
         if len == 0 || height == 0 {
             return;
         }
         let state = match focus {
             Focus::Repos => &mut self.repos.state,
-            Focus::Tree => &mut self.tree.state,
+            _ => &mut self.tree.state,
         };
 
         let max = len.saturating_sub(height);
@@ -2390,7 +2554,8 @@ impl App {
         state.select(Some(stuck));
         match focus {
             Focus::Repos => self.sync_target(),
-            Focus::Tree => self.mark_preview_dirty(),
+            // `wheel_list` returns early for the preview, which is no list.
+            _ => self.mark_preview_dirty(),
         }
     }
 
@@ -2404,7 +2569,7 @@ impl App {
     /// into it by the render, so the selection may only be left on a row that
     /// fits entirely between the new view's edges.
     fn wheel_zoom(&mut self, down: bool) {
-        let Some(rows_len) = self.zoom_doc().map(|doc| doc.rows_len()) else {
+        let Some(rows_len) = self.focused_doc().map(|doc| doc.rows_len()) else {
             return;
         };
         // Without a frame to measure there is no telling what a notch moves.
@@ -2443,9 +2608,9 @@ impl App {
             return;
         };
 
-        let cursor = self.zoom_doc().map_or(0, |doc| doc.cursor());
+        let cursor = self.focused_doc().map_or(0, |doc| doc.cursor());
         self.preview.scroll = new_top.min(u16::MAX as usize) as u16;
-        if let Some(doc) = self.zoom_doc_mut() {
+        if let Some(doc) = self.focused_doc_mut() {
             doc.set_cursor(cursor.clamp(first, last));
         }
     }
@@ -2490,16 +2655,22 @@ impl App {
             return;
         }
 
-        // A zoomed JSONL preview: select the record under the pointer, and
-        // unfold it on the second click, as a double-click does everywhere else.
-        if self.zoom_doc().is_some()
+        // A foldable document — the zoom, or the preview pane holding a `.json`.
+        // The click focuses the pane and selects the row under the pointer, and
+        // the second one folds it: the same gesture every list here answers to.
+        // Unzoomed this only speaks for a `.json`; a text preview or a `.jsonl`
+        // has no rows and falls through to the panes below.
+        if (self.zoomed() || self.preview_folds())
             && let Some(area) = self.hits.preview
             && Hits::hit(area, col, row)
         {
             let Some(&line) = self.hits.preview_rows.get((row - area.y) as usize) else {
                 return;
             };
-            if let Some(doc) = self.zoom_doc_mut() {
+            if !self.zoomed() {
+                self.focus = Focus::Preview;
+            }
+            if let Some(doc) = self.focused_doc_mut() {
                 doc.set_cursor(line);
                 if double {
                     doc.toggle_row(line);
@@ -2521,7 +2692,8 @@ impl App {
                 self.repos.state.select(Some(line));
                 self.sync_target();
             }
-            Focus::Tree => self.tree.state.select(Some(line)),
+            // `pane_at` names only the two list panes.
+            _ => self.tree.state.select(Some(line)),
         }
         self.mark_preview_dirty();
 
@@ -2533,7 +2705,7 @@ impl App {
                     .repos
                     .selected_row()
                     .is_some_and(|r| r.reference.is_none() && r.expandable),
-                Focus::Tree => self.tree.selected().is_some_and(|n| n.is_dir()),
+                _ => self.tree.selected().is_some_and(|n| n.is_dir()),
             };
             if expandable {
                 self.toggle();
@@ -2761,8 +2933,25 @@ impl App {
 
     // ── filter ───────────────────────────────────────────────────────────
 
+    /// `/` — start typing into the focused pane's filter, if it has one.
+    ///
+    /// The preview has none: it is one file rather than a list, and letting the
+    /// mode open there would swallow every keystroke into a search that could
+    /// never match anything.
+    pub fn start_filter(&mut self) {
+        if self.focus == Focus::Preview {
+            self.set_status(
+                "nothing to search in a file — ← goes back to the tree",
+                false,
+            );
+            return;
+        }
+        self.mode = Mode::Filter;
+    }
+
     fn refilter(&mut self) {
         match self.focus {
+            Focus::Preview => {}
             Focus::Repos => {
                 self.repos.rebuild();
                 self.sync_target();
@@ -2788,6 +2977,7 @@ impl App {
         match self.focus {
             Focus::Repos => self.repos.filter.push(c),
             Focus::Tree => self.tree.filter.push(c),
+            Focus::Preview => return,
         }
         self.refilter();
     }
@@ -2796,6 +2986,7 @@ impl App {
         match self.focus {
             Focus::Repos => self.repos.filter.pop(),
             Focus::Tree => self.tree.filter.pop(),
+            Focus::Preview => return,
         };
         self.refilter();
     }
@@ -2804,6 +2995,7 @@ impl App {
         match self.focus {
             Focus::Repos => self.repos.filter.clear(),
             Focus::Tree => self.tree.filter.clear(),
+            Focus::Preview => return,
         }
         self.refilter();
     }
@@ -2993,86 +3185,10 @@ fn render_body(path: &str, bytes: &[u8], truncated: bool) -> PreviewBody {
     if (head.starts_with('{') || head.starts_with('['))
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
     {
-        let mut lines = Vec::new();
-        write_json(&value, 0, None, false, &mut lines);
-        return PreviewBody::Json {
-            lines,
-            doc: crate::jsonl::JsonDoc::new(value),
-        };
+        return PreviewBody::Json(crate::jsonl::JsonDoc::new(value));
     }
 
     PreviewBody::Text(text.lines().map(|l| l.replace('\t', "    ")).collect())
-}
-
-/// Render `value` as indented, tokenised lines. `key` prefixes the value when
-/// it sits inside an object; `comma` appends a separator.
-fn write_json(
-    value: &serde_json::Value,
-    depth: usize,
-    key: Option<&str>,
-    comma: bool,
-    out: &mut Vec<JsonLine>,
-) {
-    use serde_json::Value;
-
-    let pad = "  ".repeat(depth);
-    let mut line: JsonLine = vec![(JsonTok::Punct, pad.clone())];
-    if let Some(key) = key {
-        line.push((JsonTok::Key, quote(key)));
-        line.push((JsonTok::Punct, ": ".to_string()));
-    }
-
-    // Open a container, recurse, then close it on its own line.
-    let (open, close) = match value {
-        Value::Object(map) if !map.is_empty() => ("{", "}"),
-        Value::Array(items) if !items.is_empty() => ("[", "]"),
-        _ => {
-            let (tok, text) = match value {
-                Value::Null => (JsonTok::Null, "null".to_string()),
-                Value::Bool(b) => (JsonTok::Bool, b.to_string()),
-                Value::Number(n) => (JsonTok::Num, n.to_string()),
-                Value::String(s) => (JsonTok::Str, quote(s)),
-                Value::Array(_) => (JsonTok::Punct, "[]".to_string()),
-                Value::Object(_) => (JsonTok::Punct, "{}".to_string()),
-            };
-            line.push((tok, text));
-            if comma {
-                line.push((JsonTok::Punct, ",".to_string()));
-            }
-            out.push(line);
-            return;
-        }
-    };
-
-    line.push((JsonTok::Punct, open.to_string()));
-    out.push(line);
-
-    match value {
-        Value::Object(map) => {
-            let last = map.len() - 1;
-            for (i, (k, v)) in map.iter().enumerate() {
-                write_json(v, depth + 1, Some(k), i != last, out);
-            }
-        }
-        Value::Array(items) => {
-            let last = items.len() - 1;
-            for (i, v) in items.iter().enumerate() {
-                write_json(v, depth + 1, None, i != last, out);
-            }
-        }
-        _ => unreachable!("only containers reach here"),
-    }
-
-    let mut tail = vec![(JsonTok::Punct, format!("{pad}{close}"))];
-    if comma {
-        tail.push((JsonTok::Punct, ",".to_string()));
-    }
-    out.push(tail);
-}
-
-/// Quote and escape a string the way JSON expects.
-fn quote(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""))
 }
 
 fn hex_dump(bytes: &[u8]) -> Vec<String> {
@@ -3373,13 +3489,10 @@ mod tests {
         let mut doc = crate::jsonl::JsonDoc::new(value);
         // Resting inside `"a"`, so `←` has somewhere to wind out of.
         doc.cursor = 2;
-        app.preview.body = Some(PreviewBody::Json {
-            lines: Vec::new(),
-            doc,
-        });
+        app.preview.body = Some(PreviewBody::Json(doc));
         app.enter();
         assert_eq!(app.mode, Mode::Zoom);
-        let open = app.zoom_doc().unwrap().rows_len();
+        let open = app.focused_doc().unwrap().rows_len();
 
         // Out to `"a"`, which folds; after that there is nowhere left to go, and
         // none of the presses leaves.
@@ -3387,7 +3500,7 @@ mod tests {
             app.back();
             assert_eq!(app.mode, Mode::Zoom, "`←` left the zoom");
         }
-        let shut = app.zoom_doc().unwrap().rows_len();
+        let shut = app.focused_doc().unwrap().rows_len();
         assert!(shut < open, "`←` folded nothing: {shut} of {open} rows");
 
         // `Esc` and `Backspace` are the way out.
@@ -3407,5 +3520,262 @@ mod tests {
         assert!(app.leave_zoom(), "the zoom went unreported");
         assert_eq!(app.mode, Mode::Normal);
         assert!(!app.leave_zoom(), "left twice");
+    }
+
+    // ── folds outlive the preview holding them ───────────────────────────
+
+    const OBJECT: &[u8] = br#"{"a":1,"b":{"c":2}}"#;
+
+    fn key(path: &str) -> (String, String, String) {
+        ("repo".into(), "main".into(), path.into())
+    }
+
+    /// Land a fetched body on the preview the way the reply does, under `key`.
+    fn arrive(app: &mut App, key: (String, String, String), path: &str, bytes: &[u8]) {
+        app.preview.key = Some(key);
+        app.preview.req = app.req_id();
+        let req = app.preview.req;
+        app.on_msg(Msg::Preview(
+            req,
+            Ok(PreviewPayload {
+                stat: stat(path, false),
+                bytes: bytes.to_vec(),
+                truncated: false,
+            }),
+        ));
+    }
+
+    /// Rows on show, which is how much of the document is folded.
+    fn shown(app: &mut App) -> usize {
+        app.json_doc_mut().expect("a JSON preview").rows_len()
+    }
+
+    /// A preview lasts only as long as the selection sits on it, so without a
+    /// memory of its own every fold would be undone by a glance at the file next
+    /// door.
+    #[tokio::test]
+    async fn a_json_file_comes_back_folded_the_way_it_was_left() {
+        let mut app = test_app();
+        arrive(&mut app, key("a.json"), "a.json", OBJECT);
+
+        let open = shown(&mut app);
+        // Row 2 is `▾ "b": {` — row 0 is the file's own brace, row 1 is `"a"`.
+        app.json_doc_mut().unwrap().toggle_row(2);
+        let folded = shown(&mut app);
+        assert!(folded < open, "nothing folded: {folded} of {open} rows");
+
+        // Away, through the clearing a directory or a lost ref does...
+        app.clear_preview();
+        assert!(app.preview.body.is_none());
+        // ...and back, refetched from scratch: it is put back as it was.
+        arrive(&mut app, key("a.json"), "a.json", OBJECT);
+        assert_eq!(shown(&mut app), folded, "the folds were forgotten");
+    }
+
+    /// The shape belongs to the object, not to the pane: another file arriving
+    /// in between neither loses it nor inherits it.
+    #[tokio::test]
+    async fn one_file_s_folds_are_not_another_s() {
+        let mut app = test_app();
+        arrive(&mut app, key("a.json"), "a.json", OBJECT);
+        let open = shown(&mut app);
+        app.json_doc_mut().unwrap().toggle_row(2);
+        let folded = shown(&mut app);
+
+        app.clear_preview();
+        arrive(&mut app, key("b.json"), "b.json", OBJECT);
+        assert_eq!(shown(&mut app), open, "b.json opened with a.json's folds");
+
+        app.clear_preview();
+        arrive(&mut app, key("a.json"), "a.json", OBJECT);
+        assert_eq!(shown(&mut app), folded);
+    }
+
+    /// Reading past the cap drops the oldest shapes rather than growing for the
+    /// length of the session.
+    #[tokio::test]
+    async fn only_so_many_fold_shapes_are_kept() {
+        let mut app = test_app();
+        for i in 0..FOLD_MEMORY + 4 {
+            arrive(&mut app, key(&format!("{i}.json")), "n.json", OBJECT);
+            app.json_doc_mut().unwrap().toggle_row(2);
+            app.clear_preview();
+        }
+        assert_eq!(app.folds.len(), FOLD_MEMORY);
+        // The oldest went; the newest stayed.
+        assert!(app.folds.iter().all(|(k, _)| k.2 != "0.json"));
+        let last = key(&format!("{}.json", FOLD_MEMORY + 3));
+        assert!(app.folds.iter().any(|(k, _)| *k == last));
+    }
+
+    /// `.jsonl` is left as it was: its records fold in the zoom alone, and that
+    /// state still goes with the preview.
+    #[tokio::test]
+    async fn a_jsonl_file_keeps_nothing() {
+        let mut app = test_app();
+        let records = b"{\"a\":1}\n{\"a\":2}\n";
+        arrive(&mut app, key("a.jsonl"), "a.jsonl", records);
+        app.mode = Mode::Zoom;
+        app.focused_doc_mut().unwrap().toggle_row(0);
+        assert!(
+            app.focused_doc().unwrap().rows_len() > 2,
+            "the record opened"
+        );
+
+        app.clear_preview();
+        assert!(app.folds.is_empty(), "a .jsonl left a shape behind");
+        arrive(&mut app, key("a.jsonl"), "a.jsonl", records);
+        assert_eq!(
+            app.focused_doc().unwrap().rows_len(),
+            2,
+            "the records came back open"
+        );
+    }
+
+    // ── the cursor steps into the preview ────────────────────────────────
+
+    /// A tree on one file, with `body` previewed under it.
+    fn app_reading(path: &str, body: &[u8]) -> App {
+        let mut app = test_app();
+        app.tree.key = Some(("repo".into(), "main".into()));
+        app.on_msg(Msg::Children {
+            generation: app.tree.generation,
+            prefix: String::new(),
+            res: Ok(vec![stat(path, false)]),
+        });
+        app.focus = Focus::Tree;
+        app.tree.state.select(Some(0));
+        arrive(&mut app, key(path), path, body);
+        app.status = None;
+        app
+    }
+
+    /// `→` at the tree's right edge steps into the preview, the same move it
+    /// makes from pane one into the tree — but only where there is a document
+    /// for the cursor to drive.
+    #[tokio::test]
+    async fn right_steps_into_a_json_preview_and_nothing_else() {
+        let mut app = app_reading("a.json", OBJECT);
+        app.open();
+        assert_eq!(app.focus, Focus::Preview);
+        assert_eq!(app.mode, Mode::Normal, "`→` zoomed");
+        assert!(app.status.is_none(), "`→` had something to say");
+
+        // A `.jsonl` folds in the zoom alone, so the tree keeps the keys and `→`
+        // says what does open it.
+        let mut app = app_reading("a.jsonl", b"{\"a\":1}\n");
+        app.open();
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("a.jsonl")),
+            "{:?}",
+            app.status.as_ref().map(|s| &s.text)
+        );
+
+        // And so does plain text.
+        let mut app = app_reading("a.txt", b"hello\n");
+        app.open();
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    /// `Esc` and `Backspace` leave the pane in one press, without folding their
+    /// way out the way `←` does.
+    #[tokio::test]
+    async fn escape_leaves_the_preview_in_one_press() {
+        let mut app = app_reading("a.json", OBJECT);
+        assert!(!app.leave_preview(), "the tree had the keys");
+
+        app.open();
+        let open = shown(&mut app);
+        assert!(app.leave_preview());
+        assert_eq!(app.focus, Focus::Tree);
+        assert_eq!(shown(&mut app), open, "leaving folded something");
+        assert!(!app.leave_preview(), "left twice");
+    }
+
+    /// The cursor must not sit in a pane it cannot drive. Moving off the object
+    /// takes the preview with it, and a reload can land something with nothing
+    /// to fold.
+    #[tokio::test]
+    async fn the_keys_go_back_to_the_tree_when_the_document_does() {
+        let mut app = app_reading("a.json", OBJECT);
+        app.open();
+        assert_eq!(app.focus, Focus::Preview);
+        app.clear_preview();
+        assert_eq!(app.focus, Focus::Tree, "the cursor stayed in an empty pane");
+
+        let mut app = app_reading("a.json", OBJECT);
+        app.open();
+        assert_eq!(app.focus, Focus::Preview);
+        // The same object, rewritten as something that does not parse.
+        arrive(&mut app, key("a.json"), "a.json", b"not json at all");
+        assert_eq!(app.focus, Focus::Tree, "the cursor stayed on a text body");
+    }
+
+    /// The focus outlives a change of tab, so that coming back to Browse puts
+    /// you where you left off — which means the document keys have to ask which
+    /// tab they are on before folding a file nobody can see.
+    #[tokio::test]
+    async fn the_document_keys_are_the_browse_tab_s_alone() {
+        let mut app = app_reading("a.json", OBJECT);
+        app.open();
+        assert_eq!(app.focus, Focus::Preview);
+        let open = shown(&mut app);
+
+        app.tab = Tab::Commits;
+        app.collapse_all();
+        app.select_edge(false);
+        app.move_selection(3);
+        assert_eq!(shown(&mut app), open, "the commit log folded the preview");
+
+        // Back on Browse the cursor is where it was, and the keys work again.
+        app.tab = Tab::Browse;
+        app.collapse_all();
+        assert!(shown(&mut app) < open, "the preview stopped folding");
+    }
+
+    /// The preview is one file, not a list, so `/` has nothing to search there —
+    /// and must not open a mode that would swallow every keystroke.
+    #[tokio::test]
+    async fn the_preview_has_no_search() {
+        let mut app = app_reading("a.json", OBJECT);
+        app.open();
+        app.start_filter();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.status.is_some(), "`/` said nothing");
+
+        app.leave_preview();
+        app.start_filter();
+        assert_eq!(app.mode, Mode::Filter, "the tree lost its search");
+    }
+
+    /// `d` in the preview means the file the preview is reading, not "you are in
+    /// the wrong pane". Checked by the complaint it does not make: the fetch
+    /// itself writes to the working directory, which is no business of a test.
+    #[tokio::test]
+    async fn download_is_not_refused_in_the_preview() {
+        let mut app = test_app();
+        app.tree.key = Some(("repo".into(), "main".into()));
+        app.on_msg(Msg::Children {
+            generation: app.tree.generation,
+            prefix: String::new(),
+            res: Ok(vec![stat("data/", true)]),
+        });
+        app.tree.state.select(Some(0));
+
+        // A directory is refused for being a directory, which is the check just
+        // past the focus one — so reaching it is the focus guard letting us by.
+        app.focus = Focus::Preview;
+        app.download_selected();
+        let refused = &app.status.as_ref().expect("`d` said nothing").text;
+        assert!(refused.contains("directory"), "{refused}");
+
+        // Pane one has no file selected at all, and is still turned away.
+        app.focus = Focus::Repos;
+        app.download_selected();
+        let refused = &app.status.as_ref().unwrap().text;
+        assert!(refused.contains("select a file in the tree"), "{refused}");
     }
 }

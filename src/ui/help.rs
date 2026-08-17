@@ -37,11 +37,17 @@ const ABOUT: &str = "Three panes: repositories, the object tree of one ref, and 
 detail/preview pane. Selecting a repository opens its default branch; → expands it to pick \
 another branch or tag. In the tree → and ← open and close directories, Enter on a file zooms its \
 preview full-screen — Esc leaves it — where long lines wrap; the side pane lets them overflow. At a pane's edge → \
-and ← move focus instead. / in the tree searches recursively, \
+and ← move focus instead, the preview included when it is reading a .json. / in the tree searches recursively, \
 walking into closed directories and opening the path to every match; Esc restores the shape \
 you had open. Set ui.mouse = false to hand the mouse back to your terminal.";
 
-const FOLDING: &str = "A zoomed .json opens unfolded all the way down, the whole file on show. A \
+const FOLDING: &str = "→ on a .json steps the cursor out of the tree and into the preview, where the \
+keys below fold it — one more step right, like the one from the repositories into the tree. ← folds \
+its way back out and hands the tree the keys again; Esc and Backspace leave in one press. It is one \
+document zoomed or not, so what you fold in the pane is folded in the zoom too, and the shape keeps \
+for the session — leave the file and come back and it is as you left it. A .jsonl stays a flat row \
+per record beside the tree; the zoom is where those open. \
+A zoomed .json opens unfolded all the way down, the whole file on show. A \
 zoomed .jsonl starts folded instead, listing its records a row apiece. \
 →, Enter or space unfolds the selected row a level at a time; \
 space folds it back up too, from its opening row or its closing bracket either way. ← winds back out, \
@@ -49,7 +55,7 @@ folding what is open and stepping out of what is not, and does nothing once noth
 close; Esc and Backspace are what leave the zoom. Folded rows are truncated — unfolding is how you see the rest \
 — and everything else wraps. a on a folded row unfolds the whole document, all the way down; on \
 an open one it brings every record to the level that row is open to. c folds all of it back up. A \
-zoomed .json has nothing to level itself against, so a opens all of it and c shuts it to its own \
+.json has nothing to level itself against, so a opens all of it and c shuts it to its own \
 members. F over a zoomed .jsonl opens a menu of the keys its records use, \
 each switchable: space switches one, ← → fold the tree, a/n switch all or none, Enter applies and \
 Esc puts the old filter back.";

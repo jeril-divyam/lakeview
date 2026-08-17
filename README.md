@@ -88,15 +88,15 @@ An optional `[ui]` table tunes the layout and fetch limits — pane widths,
 | Key | Action |
 |---|---|
 | `j` `k` / `↓` `↑` | move |
-| `l` `→` | expand; at a pane's edge, move focus right; in a zoom, unfold a row |
+| `l` `→` | expand; at a pane's edge, move focus right — into a previewed `.json`, where it unfolds a row |
 | `Enter` | everything `→` does, and on a file it zooms the preview full-screen |
-| `h` `←` | collapse, else go to the parent; at the top level, move focus left; in a zoom, fold back up |
-| `Esc` `Backspace` | leave a zoom. Outside one, `Esc` clears the search |
+| `h` `←` | collapse, else go to the parent; at the top level, move focus left; folding a document is how it leaves one |
+| `Esc` `Backspace` | leave a zoom, or step out of the preview. Outside both, `Esc` clears the search |
 | `space` | expand / collapse in place, without moving focus |
 | `g` / `G` | first / last entry |
 | `Ctrl-d` / `Ctrl-u` | half-page down / up |
 | `/` | search the focused pane |
-| `a` / `c` | in a zoom, unfold it all / fold it all back up |
+| `a` / `c` | in a document, unfold it all / fold it all back up |
 | `F` | in a zoomed `.jsonl`, filter which keys the records show |
 | `d` | download the selected file into the working directory |
 | `r` | reload the focused pane |
@@ -104,9 +104,9 @@ An optional `[ui]` table tunes the layout and fetch limits — pane widths,
 | `1` `2` `3` / `Tab` | switch tab |
 | `q` / `Ctrl-c` | quit |
 
-Mouse is on by default: click to select, double-click to expand, drag the pane
-borders to resize, wheel to scroll. Set `mouse = false` under `[ui]` to keep
-your terminal's own text selection.
+Mouse is on by default: click to select, double-click to expand or fold, drag
+the pane borders to resize, wheel to scroll. Set `mouse = false` under `[ui]` to
+keep your terminal's own text selection.
 
 ## What it does
 
@@ -118,9 +118,14 @@ you had open.
 binaries, capped at `preview_bytes`. Press `Enter` on a file to zoom it
 full-screen.
 
-**JSON and JSONL.** A zoomed `.json` folds a level at a time. A `.jsonl` or
-`.ndjson` gives every record its own row, unfolding one level at a time, and `F`
-switches off the keys you'd rather not read.
+**JSON and JSONL.** A `.json` folds a level at a time, in the preview pane as
+well as zoomed. `→` on the file steps the cursor out of the tree and into the
+preview — one more step right, like the one from the repositories into the tree
+— and `←` folds its way back out. Both views are one document, so a fold shows
+in either, and the shape is kept for the session: leave the file and come back
+and it is as you left it. A `.jsonl` or `.ndjson` gives every record its own
+row, unfolding one level at a time in the zoom, and `F` switches off the keys
+you'd rather not read.
 
 **Download.** `d` fetches the whole object — not just the previewed head — and
 streams it to the working directory. An existing file is never overwritten.

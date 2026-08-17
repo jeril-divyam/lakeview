@@ -37,7 +37,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     app.hits.repos = None;
     app.hits.tree = None;
     app.hits.preview = None;
+    // The side pane draws foldable rows too now, so a frame that draws none must
+    // not leave the last one's map behind for a click to land on.
     app.hits.preview_rows.clear();
+    app.hits.preview_row_starts.clear();
+    app.hits.preview_lines = 0;
     app.hits.commits = None;
     app.hits.dividers.clear();
     app.hits.repos_toggle = None;
@@ -495,7 +499,8 @@ fn render_tree_row(tree: &TreeView, slot: usize, width: usize, tick: usize) -> L
 fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, zoomed: bool) -> Rect {
     let heading = match app.focus {
         Focus::Repos => app.repos.selected_row().map(|r| r.label.clone()),
-        Focus::Tree => app.tree.selected().map(|n| n.name.clone()),
+        // The preview is reading whatever the tree is on, so it is named for it.
+        Focus::Tree | Focus::Preview => app.tree.selected().map(|n| n.name.clone()),
     }
     .unwrap_or_else(|| "Details".into());
 
@@ -521,7 +526,10 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, zoomed: bool) -> Re
         right.push(Span::styled(" zoom ", Theme::chip()));
         right.push(Span::raw(" "));
     }
-    let block = pane_block(&heading, Theme::title(zoomed), right, zoomed, area.width)
+    // A zoom owns the screen, and the pane wears the focus when the cursor is in
+    // it — the same border and title every other pane gets for having the keys.
+    let lit = zoomed || app.focus == Focus::Preview;
+    let block = pane_block(&heading, Theme::title(lit), right, lit, area.width)
         .padding(Padding::new(1, 1, 1, 0));
 
     let inner = block.inner(area);
@@ -529,14 +537,29 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect, zoomed: bool) -> Re
 
     // A zoomed foldable document is a list of its own, with a selection and rows
     // to unfold, so it draws itself rather than flattening to a paragraph.
-    if zoomed && app.zoom_doc().is_some() {
+    if zoomed && app.focused_doc().is_some() {
         draw_zoom(frame, app, inner);
+        return inner;
+    }
+
+    // A `.json` beside the tree folds too. It only carries a cursor once `→` has
+    // stepped into it: unfocused it is something you are glancing at, and a lit
+    // row there would read as a selection you could move. Pane one puts its own
+    // details in here, so a body behind them is not drawn at all.
+    if !zoomed && app.focus != Focus::Repos && app.preview_folds() {
+        let Some(PreviewBody::Json(doc)) = &app.preview.body else {
+            unreachable!("preview_folds said there was one")
+        };
+        let rows = json_rows(doc);
+        let cursor =
+            (app.focus == Focus::Preview).then(|| doc.cursor.min(rows.len().saturating_sub(1)));
+        draw_rows(frame, app, inner, rows, cursor);
         return inner;
     }
 
     let mut lines = match app.focus {
         Focus::Repos => repos_detail(app),
-        Focus::Tree => tree_detail(app, inner.width),
+        Focus::Tree | Focus::Preview => tree_detail(app),
     };
 
     // Only zoom re-flows. In the side pane a long JSON string would cost a
@@ -577,28 +600,55 @@ fn clamp_scroll(scroll: u16, lines: usize, height: u16) -> u16 {
 /// rows under it. Everything else wraps, so the long string values an unfolded
 /// container exposes can be read at full width.
 fn draw_zoom(frame: &mut Frame, app: &mut App, area: Rect) {
-    let (width, height) = (area.width as usize, area.height as usize);
-    if width == 0 || height == 0 {
-        return;
-    }
-
     // Take everything the layout needs by value, so the doc isn't still
     // borrowed when the scroll and the hit map are written back.
     let Some((rows, cursor)) = zoom_rows(app) else {
         return;
     };
+    draw_rows(frame, app, area, rows, Some(cursor));
+}
+
+/// Draw a foldable document's rows into `area`, recording what was drawn where
+/// so a click can be mapped back to a row.
+///
+/// `cursor` is the selected row, which the zoom has and the side pane does not.
+/// With one, the row lights up and the view is moved to keep it on screen; with
+/// none, the scroll is simply held inside the body — folding a row changes how
+/// tall the body is, and there is no selection here to steer by.
+fn draw_rows(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    rows: Vec<(Line<'static>, bool)>,
+    cursor: Option<usize>,
+) {
+    let (width, height) = (area.width as usize, area.height as usize);
+    if width == 0 || height == 0 {
+        return;
+    }
     if rows.is_empty() {
         frame.render_widget(centered_note("nothing to show", Theme::faint()), area);
         return;
     }
-    let lines = zoom_layout(rows, cursor, width);
-    let first = lines.iter().position(|(r, _)| *r == cursor).unwrap_or(0);
-    let last = lines
-        .iter()
-        .rposition(|(r, _)| *r == cursor)
-        .map_or(first + 1, |i| i + 1);
 
-    let top = reveal(app.preview.scroll as usize, first, last, height, lines.len());
+    let lines = zoom_layout(rows, cursor, width);
+    let top = match cursor {
+        Some(cursor) => {
+            let first = lines.iter().position(|(r, _)| *r == cursor).unwrap_or(0);
+            let last = lines
+                .iter()
+                .rposition(|(r, _)| *r == cursor)
+                .map_or(first + 1, |i| i + 1);
+            reveal(
+                app.preview.scroll as usize,
+                first,
+                last,
+                height,
+                lines.len(),
+            )
+        }
+        None => clamp_scroll(app.preview.scroll, lines.len(), area.height) as usize,
+    };
     app.preview.scroll = top.min(u16::MAX as usize) as u16;
 
     app.hits.preview_row_starts = row_starts(&lines);
@@ -629,19 +679,24 @@ fn zoom_rows(app: &App) -> Option<(Vec<(Line<'static>, bool)>, usize)> {
                 .collect();
             Some((lines, cursor))
         }
-        Some(PreviewBody::Json { doc, .. }) => {
-            let rows = doc.rows();
-            let cursor = doc.cursor.min(rows.len().saturating_sub(1));
-            let gutter = rows.len().to_string().len().max(2);
-            let lines = rows
-                .iter()
-                .enumerate()
-                .map(|(i, r)| (json_line(r, i + 1, gutter), r.folded))
-                .collect();
-            Some((lines, cursor))
+        Some(PreviewBody::Json(doc)) => {
+            let cursor = doc.cursor.min(doc.rows().len().saturating_sub(1));
+            Some((json_rows(doc), cursor))
         }
         _ => None,
     }
+}
+
+/// A JSON file's rows, numbered by their own place in the document, each paired
+/// with whether it is folded. The same rows serve the zoom and the side pane —
+/// one document, so what is folded in either is folded in both.
+fn json_rows(doc: &crate::jsonl::JsonDoc) -> Vec<(Line<'static>, bool)> {
+    let rows = doc.rows();
+    let gutter = rows.len().to_string().len().max(2);
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| (json_line(r, i + 1, gutter), r.folded))
+        .collect()
 }
 
 /// Lay every row out into the screen lines it occupies, each tagged with the row
@@ -650,7 +705,7 @@ fn zoom_rows(app: &App) -> Option<(Vec<(Line<'static>, bool)>, usize)> {
 /// how tall the rows above it are.
 fn zoom_layout(
     rows: Vec<(Line<'static>, bool)>,
-    cursor: usize,
+    cursor: Option<usize>,
     width: usize,
 ) -> Vec<(usize, Line<'static>)> {
     let mut out = Vec::with_capacity(rows.len());
@@ -664,7 +719,7 @@ fn zoom_layout(
         for line in laid_out {
             // The whole of a wrapped row lights up, so the selection reads as
             // one row rather than as the one line the cursor happens to be on.
-            let line = if i == cursor {
+            let line = if cursor == Some(i) {
                 line.style(Theme::selection(true))
             } else {
                 line
@@ -961,7 +1016,7 @@ fn repos_detail(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-fn tree_detail(app: &App, width: u16) -> Vec<Line<'static>> {
+fn tree_detail(app: &App) -> Vec<Line<'static>> {
     let Some(node) = app.tree.selected() else {
         return vec![Line::styled("nothing selected", Theme::faint())];
     };
@@ -985,11 +1040,11 @@ fn tree_detail(app: &App, width: u16) -> Vec<Line<'static>> {
     // its size, its type, the commit behind it, where it sits in the store — is
     // either on its row in the tree already or not what anyone opened the pane
     // to read, so the preview has the whole of it.
-    lines.extend(preview_lines(app, width));
+    lines.extend(preview_lines(app));
     lines
 }
 
-fn preview_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+fn preview_lines(app: &App) -> Vec<Line<'static>> {
     // No rule at the top: it used to divide the object's details from its
     // contents, and there are no details left above it to divide them from.
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1013,24 +1068,9 @@ fn preview_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         Some(PreviewBody::Text(rows)) if rows.is_empty() => {
             lines.push(Line::styled("empty file", Theme::faint()));
         }
-        Some(PreviewBody::Json { lines: rows, .. }) => {
-            let gutter = rows.len().to_string().len().max(2);
-            for (i, row) in rows.iter().enumerate() {
-                let mut spans = vec![Span::styled(format!("{:>gutter$} ", i + 1), Theme::faint())];
-                spans.extend(
-                    row.iter()
-                        .map(|(tok, text)| Span::styled(text.clone(), Theme::json(*tok))),
-                );
-                // A file is one value read top to bottom, so a long string in the
-                // middle of it is worth the lines it takes: cutting it at the
-                // edge hides the only part that says what the value is. The wrap
-                // hangs under the nesting, so the shape still reads down the pane
-                // and the numbered lines stay the file's own.
-                let line = Line::from(spans);
-                let indent = hanging_indent(&line);
-                lines.extend(wrap_line(line, width as usize, indent));
-            }
-        }
+        // Drawn as foldable rows by `draw_detail`, which needs the frame to
+        // record what it put where; it never reaches this flattening.
+        Some(PreviewBody::Json(_)) => {}
         Some(PreviewBody::Text(rows)) => {
             let gutter = rows.len().to_string().len().max(2);
             for (i, row) in rows.iter().enumerate() {
@@ -1253,7 +1293,7 @@ mod tests {
     }
 
     fn laid_out(doc: &crate::jsonl::Doc, width: usize) -> Vec<String> {
-        zoom_layout(jsonl_rows(doc), doc.cursor, width)
+        zoom_layout(jsonl_rows(doc), Some(doc.cursor), width)
             .iter()
             .map(|(_, line)| text(line))
             .collect()
@@ -1303,7 +1343,7 @@ mod tests {
         let mut doc = crate::jsonl::parse(&format!("{raw}\n{raw}\n"), false);
         doc.toggle_row(0);
         let rows = doc.rows();
-        let lines = zoom_layout(jsonl_rows(&doc), doc.cursor, 40);
+        let lines = zoom_layout(jsonl_rows(&doc), Some(doc.cursor), 40);
         // Monotonic, starting at 0, and never naming a row that isn't there.
         assert_eq!(lines[0].0, 0);
         assert!(lines.windows(2).all(|w| w[1].0 == w[0].0 || w[1].0 == w[0].0 + 1));
@@ -1389,7 +1429,7 @@ mod tests {
             false,
         )));
 
-        let lines = preview_lines(&app, 40);
+        let lines = preview_lines(&app);
         let record = lines.last().expect("the record's line");
         let styles: Vec<Style> = record.spans.iter().map(|s| s.style).collect();
 
@@ -1400,47 +1440,189 @@ mod tests {
         assert_eq!(record.spans[0].style, Theme::faint());
     }
 
+    /// The preview pane's own columns of a rendered screen, row by row.
+    fn pane_rows(app: &App, screen: &[String]) -> Vec<String> {
+        let pane = app.hits.preview.expect("the pane records its own area");
+        (pane.y..pane.y + pane.height)
+            .map(|y| {
+                screen[y as usize]
+                    .chars()
+                    .skip(pane.x as usize)
+                    .take(pane.width as usize)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Put a `.json` body in front of the tree, as a selected file does, and
+    /// return the preview pane's own columns row by row.
+    fn side_pane(app: &mut App, json: &str, width: u16, height: u16) -> Vec<String> {
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        app.preview.body = Some(PreviewBody::Json(crate::jsonl::JsonDoc::new(value)));
+        app.focus = Focus::Tree;
+        let screen = render(app, width, height);
+        pane_rows(app, &screen)
+    }
+
     /// A `.json` file is one value read top to bottom, so the side pane wraps it
     /// rather than cutting a long string off at the edge. A `.jsonl` record
     /// doesn't — see below.
     #[tokio::test]
     async fn the_side_pane_wraps_a_long_json_value() {
-        use crate::app::JsonTok;
-
         let mut app = test_app();
         let value = "v".repeat(120);
-        // The flat rendering the side pane reads, as the parser hands it over:
-        // the nesting is a span of its own, ahead of the key.
-        app.preview.body = Some(PreviewBody::Json {
-            lines: vec![
-                vec![(JsonTok::Punct, "{".into())],
-                vec![
-                    (JsonTok::Punct, "  ".into()),
-                    (JsonTok::Key, "\"k\"".into()),
-                    (JsonTok::Punct, ": ".into()),
-                    (JsonTok::Str, format!("\"{value}\"")),
-                ],
-                vec![(JsonTok::Punct, "}".into())],
-            ],
-            doc: crate::jsonl::JsonDoc::new(serde_json::Value::Null),
-        });
+        let rows = side_pane(&mut app, &format!(r#"{{"k":"{value}"}}"#), 120, 20);
 
-        let width = 40;
-        let lines = preview_lines(&app, width);
-        for line in &lines {
+        let pane = app.hits.preview.unwrap();
+        for row in &rows {
             assert!(
-                text(line).width() <= width as usize,
-                "{:?} overflows the pane",
-                text(line)
+                row.width() <= pane.width as usize,
+                "{row:?} overflows the pane"
             );
         }
         // Every character of the value is on show, over as many lines as it took.
         // The indent each continuation hangs under is not part of it.
-        let whole: String = lines.iter().map(text).collect::<String>().replace(' ', "");
+        let whole: String = rows.concat().replace(' ', "");
         assert!(whole.contains(&value), "the value was cut: {whole:?}");
         assert!(
-            lines.len() > 4,
-            "expected the value to wrap over several lines: {lines:?}"
+            rows.iter().filter(|r| !r.is_empty()).count() > 4,
+            "expected the value to wrap over several lines: {rows:?}"
+        );
+    }
+
+    /// The side pane draws the same foldable rows the zoom does — markers and
+    /// all — so there is one shape to fold rather than two renderings to keep in
+    /// step.
+    #[tokio::test]
+    async fn the_side_pane_marks_the_rows_a_json_file_can_fold() {
+        let mut app = test_app();
+        let rows = side_pane(&mut app, r#"{"a":1,"b":{"c":2}}"#, 120, 20).join("\n");
+
+        // Unfolded all the way down, as it opens.
+        assert!(rows.contains(r#"▾ "b": {"#), "{rows}");
+        assert!(rows.contains("\"c\": 2"), "{rows}");
+        // A scalar has nothing to fold, so it carries no marker.
+        assert!(rows.contains("\"a\": 1,"), "{rows}");
+        assert!(!rows.contains(r#"▾ "a""#), "{rows}");
+        // And every screen line of the pane maps back to a row, for the mouse.
+        assert!(!app.hits.preview_rows.is_empty());
+    }
+
+    /// The cursor only shows once the pane has the keys. Unfocused it is
+    /// something you are glancing at, and a lit row would read as a selection
+    /// `j` could move.
+    #[tokio::test]
+    async fn the_side_pane_lights_a_row_only_once_it_has_the_focus() {
+        let mut app = test_app();
+        side_pane(&mut app, r#"{"a":1,"b":{"c":2}}"#, 120, 20);
+        let pane = app.hits.preview.unwrap();
+
+        // The selection is a background, not a glyph, so it is read off the
+        // buffer rather than the text.
+        let lit = |app: &mut App| {
+            use ratatui::Terminal;
+            use ratatui::backend::TestBackend;
+            let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, app, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (pane.y..pane.y + pane.height)
+                .filter(|y| buffer[(pane.x, *y)].bg == Theme::SURFACE)
+                .count()
+        };
+        assert_eq!(lit(&mut app), 0, "the tree has the keys");
+
+        app.focus = Focus::Preview;
+        assert_eq!(lit(&mut app), 1, "the cursor is in the pane");
+    }
+
+    /// `→` on a file steps into the preview, `j` and `space` fold it there, and
+    /// `←` winds back out and hands the keys to the tree.
+    #[tokio::test]
+    async fn the_cursor_steps_into_the_preview_and_folds_it() {
+        let mut app = test_app();
+        let open = side_pane(&mut app, r#"{"a":1,"b":{"c":2}}"#, 120, 20);
+        app.focus = Focus::Preview;
+
+        // Down to `▾ "b": {` — row 0 is the file's brace, row 1 is `"a"`.
+        app.move_selection(2);
+        app.toggle();
+        let screen = render(&mut app, 120, 20);
+        let folded = pane_rows(&app, &screen).join("\n");
+        assert!(folded.contains(r#"▸ "b": {"c": 2}"#), "{folded}");
+
+        // `→` unfolds and only unfolds, as it does in the zoom.
+        app.open();
+        assert_eq!(app.focus, Focus::Preview, "`→` left the pane");
+        let screen = render(&mut app, 120, 20);
+        assert_eq!(pane_rows(&app, &screen), open);
+
+        // `←` folds what is open...
+        app.back();
+        assert_eq!(app.focus, Focus::Preview, "`←` left before folding");
+        let screen = render(&mut app, 120, 20);
+        assert!(pane_rows(&app, &screen).join("\n").contains(r#"▸ "b""#));
+
+        // ...and once nothing is left in the way, steps out to the tree — and no
+        // further, the tree's own `←` being a separate press.
+        for _ in 0..4 {
+            if app.focus != Focus::Preview {
+                break;
+            }
+            app.back();
+        }
+        assert_eq!(app.focus, Focus::Tree, "`←` never left the pane");
+    }
+
+    /// One document behind both views, so what the pane folds the zoom opens on
+    /// already folded — and `Esc` puts you back where you were reading.
+    #[tokio::test]
+    async fn the_side_pane_and_the_zoom_fold_the_same_document() {
+        let mut app = test_app();
+        side_pane(&mut app, r#"{"a":1,"b":{"c":2}}"#, 120, 20);
+        app.focus = Focus::Preview;
+        app.move_selection(2);
+        app.toggle();
+
+        app.enter();
+        assert_eq!(app.mode, Mode::Zoom, "`⏎` in the pane did not zoom");
+        let zoomed = render(&mut app, 120, 20).join("\n");
+        assert!(zoomed.contains(r#"▸ "b": {"c": 2}"#), "{zoomed}");
+
+        assert!(app.leave_zoom());
+        assert_eq!(app.focus, Focus::Preview, "the zoom dropped the cursor");
+    }
+
+    /// The mouse gets the same gesture every list here answers to: click to take
+    /// the pane and the row, click again to fold it.
+    #[tokio::test]
+    async fn a_double_click_in_the_preview_takes_it_and_folds_a_row() {
+        let mut app = test_app();
+        let open = side_pane(&mut app, r#"{"a":1,"b":{"c":2}}"#, 120, 20);
+        let pane = app.hits.preview.unwrap();
+        let y = pane.y
+            + open
+                .iter()
+                .position(|r| r.contains(r#"▾ "b": {"#))
+                .expect("the container's row") as u16;
+
+        // One click focuses and selects, and folds nothing.
+        app.mouse_click(pane.x + 2, y);
+        assert_eq!(app.focus, Focus::Preview);
+        assert_eq!(app.mode, Mode::Normal, "a click zoomed");
+        let screen = render(&mut app, 120, 20);
+        assert_eq!(pane_rows(&app, &screen), open, "one click folded a row");
+
+        // The second folds it.
+        app.mouse_click(pane.x + 2, y);
+        let screen = render(&mut app, 120, 20);
+        assert!(
+            pane_rows(&app, &screen)
+                .join("\n")
+                .contains(r#"▸ "b": {"c": 2}"#)
         );
     }
 
@@ -1452,7 +1634,7 @@ mod tests {
         let record = format!(r#"{{"k":"{}"}}"#, "v".repeat(120));
         app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(&record, false)));
 
-        let lines = preview_lines(&app, 40);
+        let lines = preview_lines(&app);
         // One line for the record, however long it is.
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(text(&lines[0]).width() > 40);
@@ -1464,11 +1646,7 @@ mod tests {
     async fn a_zoomed_json_file_draws_fully_open() {
         let mut app = test_app();
         let value: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":{"c":2}}"#).unwrap();
-        app.preview.body = Some(PreviewBody::Json {
-            // Only the zoom is under test; the flat lines are the side pane's.
-            lines: Vec::new(),
-            doc: crate::jsonl::JsonDoc::new(value),
-        });
+        app.preview.body = Some(PreviewBody::Json(crate::jsonl::JsonDoc::new(value)));
         app.mode = Mode::Zoom;
         app.focus = Focus::Tree;
 
@@ -1628,7 +1806,7 @@ mod tests {
         app.mode = Mode::Zoom;
         app.focus = Focus::Tree;
 
-        let cursor = |app: &App| app.zoom_doc().expect("a foldable zoom").cursor();
+        let cursor = |app: &App| app.focused_doc().expect("a foldable zoom").cursor();
         let buffer = framed(&mut app, 60, 24);
         let pane = app.hits.preview.expect("the zoom records its own area");
         // Every record is folded onto a row of one line, so a page is the pane's
@@ -1679,7 +1857,7 @@ mod tests {
         app.focus = Focus::Tree;
 
         framed(&mut app, 60, 24);
-        let cursor = |app: &App| app.zoom_doc().expect("a foldable zoom").cursor();
+        let cursor = |app: &App| app.focused_doc().expect("a foldable zoom").cursor();
         assert_eq!(cursor(&app), 0);
 
         app.page(true);
@@ -1697,7 +1875,7 @@ mod tests {
         app.mode = Mode::Zoom;
         app.focus = Focus::Tree;
 
-        let cursor = |app: &App| app.zoom_doc().expect("a foldable zoom").cursor();
+        let cursor = |app: &App| app.focused_doc().expect("a foldable zoom").cursor();
         let buffer = framed(&mut app, 60, 24);
         let pane = app.hits.preview.expect("the zoom records its own area");
         let height = pane.height as usize;
@@ -1767,7 +1945,7 @@ mod tests {
             framed(&mut app, 60, 24);
             app.hits.preview.expect("the zoom records its own area")
         };
-        let cursor = |app: &App| app.zoom_doc().expect("a foldable zoom").cursor();
+        let cursor = |app: &App| app.focused_doc().expect("a foldable zoom").cursor();
         assert_eq!(cursor(&app), 0);
 
         app.mouse_scroll(pane.x, pane.y, true);
@@ -2098,10 +2276,7 @@ mod tests {
 
         // Zoomed, but on a whole JSON file rather than records.
         let value: serde_json::Value = serde_json::from_str(r#"{"a":1}"#).unwrap();
-        app.preview.body = Some(PreviewBody::Json {
-            lines: Vec::new(),
-            doc: crate::jsonl::JsonDoc::new(value),
-        });
+        app.preview.body = Some(PreviewBody::Json(crate::jsonl::JsonDoc::new(value)));
         app.mode = Mode::Zoom;
         app.open_keys();
         assert_eq!(app.mode, Mode::Zoom);
@@ -2639,4 +2814,6 @@ mod tests {
         assert_eq!(buffer[(area.x, area.y + 4)].fg, Theme::ACCENT);
         assert_eq!(buffer[(area.x + 1, area.y + 4)].fg, Theme::ACCENT);
     }
+
+
 }
