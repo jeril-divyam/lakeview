@@ -555,20 +555,6 @@ pub enum PreviewBody {
     Binary(Vec<String>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JsonTok {
-    Key,
-    Str,
-    Num,
-    Bool,
-    Null,
-    Punct,
-    /// The `▸` / `▾` a foldable JSONL row carries.
-    Marker,
-    /// A record that is not valid JSON, and the message saying so.
-    Error,
-}
-
 // ── modes & tabs ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

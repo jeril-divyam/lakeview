@@ -1255,7 +1255,7 @@ mod tests {
     /// same column, or an expanded record reads as two different indents.
     #[test]
     fn the_record_gutter_and_the_body_gutter_are_the_same_width() {
-        use crate::app::JsonTok;
+        use crate::jsonl::JsonTok;
 
         let header = DocRow {
             entry: 6,
@@ -1421,7 +1421,7 @@ mod tests {
     /// preview beside them does, rather than one flat run of text.
     #[tokio::test]
     async fn the_side_pane_colours_jsonl_records() {
-        use crate::app::JsonTok;
+        use crate::jsonl::JsonTok;
 
         let mut app = test_app();
         app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(

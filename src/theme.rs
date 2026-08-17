@@ -107,8 +107,8 @@ impl Theme {
     }
 
     /// Syntax colour for a JSON token in the preview pane.
-    pub fn json(tok: crate::app::JsonTok) -> Style {
-        use crate::app::JsonTok::*;
+    pub fn json(tok: crate::jsonl::JsonTok) -> Style {
+        use crate::jsonl::JsonTok::*;
         match tok {
             Key => Style::new().fg(Self::ACCENT),
             Str => Style::new().fg(Self::GREEN),

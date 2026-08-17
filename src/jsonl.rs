@@ -15,8 +15,23 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::app::JsonTok;
 use crate::keys::KeyFilter;
+
+/// The kinds of token a rendered row is made of, so the UI can colour a row
+/// through `Theme::json` without this module knowing about ratatui.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonTok {
+    Key,
+    Str,
+    Num,
+    Bool,
+    Null,
+    Punct,
+    /// The `▸` / `▾` a foldable JSONL row carries.
+    Marker,
+    /// A record that is not valid JSON, and the message saying so.
+    Error,
+}
 
 /// Columns of a folded value worth building. The pane truncates to its own
 /// width; this only has to be wider than any terminal is.
