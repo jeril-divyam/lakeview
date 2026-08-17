@@ -3,7 +3,7 @@
 //! Only the read paths the browser needs are implemented. Every list call
 //! follows pagination until the server stops or `max_entries` is reached.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures::StreamExt;
 use serde::Deserialize;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -118,6 +118,40 @@ struct ApiError {
     message: String,
 }
 
+/// A non-2xx answer, kept as a typed error so a caller can ask which status it
+/// was — `refs` forgives a 404 from the tags endpoint — while the string the
+/// footer shows stays the same as ever.
+#[derive(Debug)]
+struct HttpError {
+    what: String,
+    status: reqwest::StatusCode,
+    detail: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hint = match self.status.as_u16() {
+            401 => " — check access_key_id / secret_access_key",
+            403 => " — the credentials lack permission for this resource",
+            404 => " — not found",
+            _ => "",
+        };
+        if self.detail.trim().is_empty() {
+            write!(f, "{}: HTTP {}{hint}", self.what, self.status)
+        } else {
+            write!(f, "{}: HTTP {}{hint}: {}", self.what, self.status, self.detail)
+        }
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+/// Whether `err` is a lakeFS answer with this HTTP status.
+fn has_status(err: &anyhow::Error, status: u16) -> bool {
+    err.chain()
+        .any(|c| c.downcast_ref::<HttpError>().is_some_and(|e| e.status.as_u16() == status))
+}
+
 impl Client {
     pub fn new(profile: &Profile, page_size: u32) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -160,19 +194,17 @@ impl Client {
             .map(|e| e.message)
             .unwrap_or_else(|_| body.chars().take(200).collect());
 
-        let hint = match status.as_u16() {
-            401 => " — check access_key_id / secret_access_key",
-            403 => " — the credentials lack permission for this resource",
-            404 => " — not found",
-            _ => "",
-        };
-        if detail.trim().is_empty() {
-            bail!("{what}: HTTP {status}{hint}");
+        Err(HttpError {
+            what: what.to_string(),
+            status,
+            detail,
         }
-        bail!("{what}: HTTP {status}{hint}: {detail}");
+        .into())
     }
 
-    /// Follow `next_offset` until exhausted or `max_entries` collected.
+    /// Follow `next_offset` until exhausted or `max_entries` collected. Never
+    /// answers with more than `max_entries`: the last page is cut to the cap,
+    /// so the cap means what it says.
     async fn paged<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -209,6 +241,7 @@ impl Client {
             }
             after = page.pagination.next_offset;
         }
+        out.truncate(max_entries);
         Ok(out)
     }
 
@@ -255,14 +288,20 @@ impl Client {
             return Ok(true);
         }
         if include_tags {
-            let tags: Vec<RefEntry> = self
-                .first_page(
+            return match self
+                .first_page::<RefEntry>(
                     &format!("/repositories/{}/tags", enc(repo)),
                     1,
                     "listing tags",
                 )
-                .await?;
-            return Ok(!tags.is_empty());
+                .await
+            {
+                Ok(tags) => Ok(!tags.is_empty()),
+                // The same forgiveness `refs` extends: a server that answers
+                // 404 for a repository's tags is a server without tags there.
+                Err(e) if has_status(&e, 404) => Ok(false),
+                Err(e) => Err(e),
+            };
         }
         Ok(false)
     }
@@ -305,8 +344,7 @@ impl Client {
         out.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.id.cmp(&b.id)));
 
         if include_tags {
-            // A repo without tags is normal; don't fail the whole listing.
-            if let Ok(tags) = self
+            match self
                 .paged::<RefEntry>(
                     &format!("/repositories/{}/tags", enc(repo)),
                     &[],
@@ -315,12 +353,17 @@ impl Client {
                 )
                 .await
             {
-                out.extend(tags.into_iter().map(|t| NamedRef {
+                Ok(tags) => out.extend(tags.into_iter().map(|t| NamedRef {
                     id: t.id,
                     commit_id: t.commit_id,
                     kind: RefKind::Tag,
                     is_default: false,
-                }));
+                })),
+                // A server that answers 404 for a repository with no tags is a
+                // server without tags there; anything else — a permission
+                // error, the network — must not read as an empty tag list.
+                Err(e) if has_status(&e, 404) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(out)
@@ -357,14 +400,21 @@ impl Client {
         Ok(entries)
     }
 
-    /// Fetch at most `limit` bytes of an object using a Range request.
+    /// Fetch at most `limit` bytes of an object, saying whether it was cut
+    /// short of the whole thing.
+    ///
+    /// The Range request asks for one byte past the cap: seeing it arrive is
+    /// what tells a body of exactly `limit` bytes apart from one that was
+    /// truncated to them. The body is streamed and dropped at the cap rather
+    /// than collected, so a server that ignores `Range` — proxies strip it —
+    /// costs `limit` bytes of memory, not the whole object.
     pub async fn get_object_head(
         &self,
         repo: &str,
         reference: &str,
         path: &str,
         limit: u64,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, bool)> {
         let resp = self
             .get(&format!(
                 "/repositories/{}/refs/{}/objects",
@@ -372,13 +422,26 @@ impl Client {
                 enc(reference)
             ))
             .query(&[("path", path)])
-            .header("Range", format!("bytes=0-{}", limit.saturating_sub(1)))
+            // Range ends are inclusive, so `0-limit` is `limit + 1` bytes.
+            .header("Range", format!("bytes=0-{limit}"))
             .send()
             .await
             .context("downloading object")?;
         let resp = Self::check(resp, "downloading object").await?;
-        let bytes = resp.bytes().await.context("reading object body")?;
-        Ok(bytes.to_vec())
+
+        let cap = usize::try_from(limit).unwrap_or(usize::MAX);
+        let want = cap.saturating_add(1);
+        let mut out: Vec<u8> = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while out.len() < want {
+            let Some(chunk) = stream.next().await else { break };
+            let chunk = chunk.context("reading object body")?;
+            let room = want - out.len();
+            out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
+        let truncated = out.len() > cap;
+        out.truncate(cap);
+        Ok((out, truncated))
     }
 
     /// Stream a whole object into `sink`, returning the bytes written.
@@ -531,9 +594,11 @@ mod tests {
             let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
 
             let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
-            socket.write_all(head.as_bytes()).await.unwrap();
-            socket.write_all(body.as_bytes()).await.unwrap();
-            socket.flush().await.unwrap();
+            // Writes are best-effort: a client that has read all it wants may
+            // hang up mid-body, and that is the client's business.
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.flush().await;
         });
 
         (format!("http://{addr}"), rx)
@@ -602,5 +667,142 @@ mod tests {
 
         assert!(err.contains("path not found"), "{err}");
         assert!(sink.is_empty(), "nothing is written when the fetch fails");
+    }
+
+    // ── the preview fetch ────────────────────────────────────────────────
+
+    /// The flag used to be `len >= limit`, which called a file of exactly the
+    /// cap truncated — and, the JSONL parser dropping a truncated last line,
+    /// quietly cost such a file its final record.
+    #[tokio::test]
+    async fn a_body_of_exactly_the_cap_is_whole_not_truncated() {
+        let body = "x".repeat(100);
+        let (endpoint, request) = serve_once(body.clone()).await;
+        let client = Client::new(&profile(endpoint), 500).unwrap();
+
+        let (bytes, truncated) = client
+            .get_object_head("repo", "main", "a.txt", 100)
+            .await
+            .unwrap();
+        assert_eq!(bytes, body.as_bytes());
+        assert!(!truncated, "a whole body was called truncated");
+
+        // The extra byte that tells the two apart is asked for explicitly:
+        // Range ends are inclusive, so `0-100` is 101 bytes.
+        let head = request.await.unwrap().to_ascii_lowercase();
+        assert!(head.contains("range: bytes=0-100"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_cap_is_cut_to_it_and_says_so() {
+        let (endpoint, _request) = serve_once("y".repeat(500)).await;
+        let client = Client::new(&profile(endpoint), 500).unwrap();
+
+        let (bytes, truncated) = client
+            .get_object_head("repo", "main", "a.txt", 100)
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), 100);
+        assert!(truncated);
+    }
+
+    /// `serve_once` pays no attention to `Range`, which is exactly what a
+    /// proxy that strips the header looks like: however big the answer, only
+    /// the cap may land in memory.
+    #[tokio::test]
+    async fn a_server_that_ignores_range_cannot_overrun_the_cap() {
+        let (endpoint, _request) = serve_once("z".repeat(200_000)).await;
+        let client = Client::new(&profile(endpoint), 500).unwrap();
+
+        let (bytes, truncated) = client
+            .get_object_head("repo", "main", "big.bin", 1_000)
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), 1_000);
+        assert!(truncated);
+    }
+
+    // ── listing refs when the tags endpoint misbehaves ───────────────────
+
+    /// Serves canned responses in a loop, routing by request path. The
+    /// `Connection: close` keeps reqwest from reusing the socket, so each
+    /// request lands on a fresh accept.
+    async fn serve_routes(routes: Vec<(&'static str, u16, &'static str)>) -> String {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let (status, body) = routes
+                    .iter()
+                    .find(|(path, _, _)| head.contains(path))
+                    .map(|(_, status, body)| (*status, *body))
+                    .unwrap_or((500, ""));
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    const ONE_BRANCH: &str = r#"{"pagination":{"has_more":false,"next_offset":""},"results":[{"id":"main","commit_id":"c0ffee"}]}"#;
+
+    /// Some servers answer 404 for a repository with no tags; that is an empty
+    /// tag list, not a reason to lose the branches.
+    #[tokio::test]
+    async fn a_404_from_the_tags_endpoint_reads_as_no_tags() {
+        let endpoint = serve_routes(vec![
+            ("/branches?", 200, ONE_BRANCH),
+            ("/tags?", 404, r#"{"message":"no tags here"}"#),
+        ])
+        .await;
+        let client = Client::new(&profile(endpoint), 500).unwrap();
+
+        let refs = client.refs("repo", "main", true).await.unwrap();
+        let ids: Vec<&str> = refs.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["main"]);
+    }
+
+    /// A permission error used to be swallowed along with the 404, leaving it
+    /// indistinguishable from a repository that simply has no tags.
+    #[tokio::test]
+    async fn any_other_tags_failure_is_reported_not_swallowed() {
+        let endpoint = serve_routes(vec![
+            ("/branches?", 200, ONE_BRANCH),
+            ("/tags?", 403, r#"{"message":"insufficient permissions"}"#),
+        ])
+        .await;
+        let client = Client::new(&profile(endpoint), 500).unwrap();
+
+        let err = client.refs("repo", "main", true).await.unwrap_err().to_string();
+        assert!(err.contains("403"), "{err}");
+        assert!(err.contains("insufficient permissions"), "{err}");
+    }
+
+    /// The probe extends the same forgiveness, so a chevron never promises
+    /// tags a 404 says aren't there.
+    #[tokio::test]
+    async fn the_ref_probe_reads_a_tags_404_as_no_tags_too() {
+        let endpoint = serve_routes(vec![
+            ("/branches?", 200, ONE_BRANCH),
+            ("/tags?", 404, r#"{"message":"no tags here"}"#),
+        ])
+        .await;
+        let client = Client::new(&profile(endpoint), 500).unwrap();
+
+        // One branch, and it is the default: nothing worth a row of its own.
+        let listable = client.has_listable_refs("repo", "main", true).await.unwrap();
+        assert!(!listable);
     }
 }

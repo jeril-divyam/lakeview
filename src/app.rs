@@ -1263,8 +1263,8 @@ impl App {
             let res = client
                 .get_object_head(&repo, &reference, &object.path, limit)
                 .await
-                .map(|bytes| PreviewPayload {
-                    truncated: bytes.len() as u64 >= limit,
+                .map(|(bytes, truncated)| PreviewPayload {
+                    truncated,
                     stat: object,
                     bytes,
                 })
@@ -1803,9 +1803,10 @@ impl App {
         }
     }
 
-    /// `Ctrl-f` / `Ctrl-b` — a screenful at a time through a zoomed foldable
-    /// document. Zoom-only: the panes have `Ctrl-d` and `Ctrl-u`, and a flat
-    /// body has no rows to page between.
+    /// `Ctrl-f` / `Ctrl-b` — a screenful at a time through the foldable
+    /// document the keys are driving: the zoom, or the preview once the cursor
+    /// has stepped into a `.json`. The list panes have `Ctrl-d` and `Ctrl-u`,
+    /// and a flat body has no rows to page between.
     ///
     /// Where `Ctrl-d` moves the selection and leaves the view to chase it, this
     /// moves the view and brings the selection along to the top of it. The row
