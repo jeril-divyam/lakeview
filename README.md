@@ -76,7 +76,7 @@ secrets need not be stored on disk. `lakeview init` writes the file mode `600`.
 | `default_repo` | no | Repository to open on start-up |
 | `default_ref` | no | Ref to open on start-up |
 | `verify_tls` | no | Set `false` to accept self-signed certificates (default `true`) |
-| `timeout_secs` | no | HTTP timeout (default `30`) |
+| `timeout_secs` | no | HTTP connect/stall timeout in seconds; streaming downloads run as long as data keeps arriving (default `30`) |
 | `description` | no | Note shown by `lakeview profiles` |
 
 An optional `[ui]` table tunes the layout and fetch limits — pane widths,

@@ -52,6 +52,9 @@ pub struct Profile {
     /// Set to false to accept self-signed certificates.
     #[serde(default = "default_true")]
     pub verify_tls: bool,
+    /// Seconds before a connect or a stalled read gives up. Bounds every stall
+    /// rather than the whole request, so a large download can stream for as
+    /// long as data keeps arriving.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     /// Human-readable label shown in the header; defaults to the profile name.

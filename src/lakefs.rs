@@ -154,9 +154,17 @@ fn has_status(err: &anyhow::Error, status: u16) -> bool {
 
 impl Client {
     pub fn new(profile: &Profile, page_size: u32) -> Result<Self> {
+        // Connect and per-read timeouts rather than `timeout()`, which caps the
+        // whole request including the body: `download_object` streams objects
+        // that can legitimately take longer than any deadline, and a total
+        // timeout would abort them mid-transfer. This bounds every stall — a
+        // dead server, a hung read — without limiting how long a healthy
+        // stream may run.
+        let timeout = std::time::Duration::from_secs(profile.timeout_secs);
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(!profile.verify_tls)
-            .timeout(std::time::Duration::from_secs(profile.timeout_secs))
+            .connect_timeout(timeout)
+            .read_timeout(timeout)
             .user_agent(concat!("lakeview/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("building the HTTP client")?;
