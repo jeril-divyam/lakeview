@@ -39,6 +39,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_header(frame, app, header);
 
+    // Every frame starts from an empty hit map, whichever tab draws it. Left to
+    // the views, the Commits and Help tabs would keep the browser's rects alive
+    // under themselves, and a click there would fold panes that aren't on
+    // screen.
+    app.hits.clear();
+
     match app.tab {
         Tab::Browse => browse::draw(frame, app, body),
         Tab::Commits => commits::draw(frame, app, body),

@@ -56,8 +56,8 @@ pub struct Hits {
     pub preview: Option<Rect>,
     /// When the preview drew a foldable document — a zoom of either kind, or a
     /// `.json` in the side pane — the row each screen line of that area shows.
-    /// A row that wrapped occupies several entries. Cleared at the top of every
-    /// browse frame, so a frame that draws no rows leaves nothing to click on.
+    /// A row that wrapped occupies several entries. Cleared before every frame,
+    /// so a frame that draws no rows leaves nothing to click on.
     pub preview_rows: Vec<usize>,
     /// For the same preview, the line each row of the whole document starts at.
     /// The layout is the only account of how tall a row came out, and paging
@@ -80,6 +80,22 @@ pub struct Hits {
 }
 
 impl Hits {
+    /// Forget the last frame's geometry, so a click can only land on what the
+    /// coming frame actually draws — a rect left over from another tab must not
+    /// catch a click aimed at this one. `tabs` is exempt: the header draws on
+    /// every tab and keeps its own account.
+    pub(crate) fn clear(&mut self) {
+        self.repos = None;
+        self.tree = None;
+        self.preview = None;
+        self.preview_rows.clear();
+        self.preview_row_starts.clear();
+        self.preview_lines = 0;
+        self.commits = None;
+        self.dividers.clear();
+        self.repos_toggle = None;
+    }
+
     pub(super) fn hit(area: Rect, col: u16, row: u16) -> bool {
         col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
     }

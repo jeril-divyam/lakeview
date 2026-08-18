@@ -36,10 +36,6 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(list_area);
     frame.render_widget(block, list_area);
     app.hits.commits = Some(inner);
-    app.hits.repos = None;
-    app.hits.tree = None;
-    app.hits.preview = None;
-    app.hits.dividers.clear();
 
     match &app.commits.load {
         // `Idle` never reaches here — the commits view uses `None` for that.

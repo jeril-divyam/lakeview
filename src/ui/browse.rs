@@ -34,17 +34,9 @@ pub(crate) const SCROLL_PADDING: usize = 2;
 const MIN_NAME: usize = 10;
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
-    app.hits.repos = None;
-    app.hits.tree = None;
-    app.hits.preview = None;
-    // The side pane draws foldable rows too now, so a frame that draws none must
-    // not leave the last one's map behind for a click to land on.
-    app.hits.preview_rows.clear();
-    app.hits.preview_row_starts.clear();
-    app.hits.preview_lines = 0;
-    app.hits.commits = None;
-    app.hits.dividers.clear();
-    app.hits.repos_toggle = None;
+    // `ui::draw` already cleared the hit map for the frame; clearing again
+    // keeps this view honest when the tests drive it on its own.
+    app.hits.clear();
 
     // The key menu is a panel over the zoom rather than a place of its own, so
     // the zoom is still what is drawn under it.
@@ -2784,6 +2776,28 @@ mod tests {
         let toggle = app.hits.repos_toggle.unwrap();
         app.mouse_click(toggle.x, toggle.y);
         assert_eq!(app.cfg.ui.repos_width, 40);
+    }
+
+    #[tokio::test]
+    async fn the_other_tabs_leave_no_browser_rects_to_click() {
+        // A rect recorded by one tab dies with its frame: clicks on the Commits
+        // and Help tabs used to land on the browser's stale chevron and fold a
+        // pane that wasn't on screen.
+        let mut app = test_app();
+        app.cfg.ui.repos_width = 40;
+        for tab in [crate::app::Tab::Commits, crate::app::Tab::Help] {
+            app.tab = crate::app::Tab::Browse;
+            framed(&mut app, 120, 24);
+            let toggle = app.hits.repos_toggle.expect("no chevron was drawn");
+
+            app.tab = tab;
+            framed(&mut app, 120, 24);
+            assert!(app.hits.repos_toggle.is_none());
+            assert!(app.hits.tree.is_none());
+            assert!(app.hits.preview_rows.is_empty());
+            app.mouse_click(toggle.x, toggle.y);
+            assert_eq!(app.cfg.ui.repos_width, 40, "an invisible chevron folded the pane");
+        }
     }
 
     #[tokio::test]
