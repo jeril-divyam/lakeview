@@ -919,15 +919,18 @@ impl Doc {
         }
     }
 
-    /// Put the cursor back on `entry`'s own row after something has changed the
-    /// shape of the whole document under it. Expanding or folding every record
-    /// at once moves every row, and the record you were reading is the one thing
-    /// worth holding on to.
-    fn land_on(&mut self, entry: Option<usize>) {
-        let row = entry.and_then(|entry| {
-            self.rows()
-                .iter()
-                .position(|r| r.entry == entry && r.sub == 0)
+    /// Put the cursor back on `at` — a record and the row within it — after
+    /// something has changed the shape of the whole document under it. Expanding
+    /// or folding every record at once moves every row, and the place you were
+    /// reading is the one thing worth holding on to. A row the reshape has folded
+    /// away is gone, so it falls back to the record's own row, which survives
+    /// whatever happened inside it.
+    fn land_on(&mut self, at: Option<(usize, usize)>) {
+        let rows = self.rows();
+        let row = at.and_then(|(entry, sub)| {
+            rows.iter()
+                .position(|r| r.entry == entry && r.sub == sub)
+                .or_else(|| rows.iter().position(|r| r.entry == entry && r.sub == 0))
         });
         match row {
             // A position in the rows just built is in range by construction,
@@ -985,7 +988,7 @@ impl Doc {
         record.open = open;
         // Its rows have all been rebuilt under the cursor, and everything below
         // it has shifted; the record is what there is to hold on to.
-        self.land_on(Some(entry));
+        self.land_on(Some((entry, 0)));
     }
 }
 
@@ -1041,7 +1044,7 @@ impl Folding for Doc {
     /// A record that doesn't parse has no levels — it expands to its error and
     /// its raw text, or folds back onto its row, and nothing in between.
     fn expand_to(&mut self, depth: usize) {
-        let anchor = self.rows().get(self.cursor).map(|r| r.entry);
+        let anchor = self.rows().get(self.cursor).map(|r| (r.entry, 0));
         for entry in &mut self.entries {
             entry.expanded = depth > 0;
             entry.open = match &entry.value {
@@ -1068,6 +1071,36 @@ impl Folding for Doc {
             0 => None,
             depth => Some(depth),
         }
+    }
+
+    /// `a` levels the *rest* of the file at the cursor's record's level and
+    /// leaves that record exactly as it is. Copying the level back onto the
+    /// record it was read from would flatten it: a record open to level 2 because
+    /// one of its keys is unfolded would come back with every key at that level
+    /// unfolded, which is a change to the very row `a` is copying from. Only a
+    /// record with no level to copy — folded onto its own row — is touched, and
+    /// there `a` means "open all of this", itself included.
+    fn expand_all(&mut self) -> Option<usize> {
+        let Some(depth) = self.expand_target() else {
+            self.expand_to(usize::MAX);
+            return None;
+        };
+        let at = self.rows().get(self.cursor).map(|r| (r.entry, r.sub));
+        let cursors = at.map(|(entry, _)| entry);
+        for (i, entry) in self.entries.iter_mut().enumerate() {
+            if Some(i) == cursors {
+                continue;
+            }
+            entry.expanded = true;
+            entry.open = match &entry.value {
+                Some(value) => opened_to(value, depth),
+                None => Open::default(),
+            };
+        }
+        // The cursor's record is untouched, so the exact row it was on is still
+        // there — only the records above it have changed how many rows they take.
+        self.land_on(at);
+        Some(depth)
     }
 
     /// Ascends the way it does in the tree, and gives way only once the record
@@ -1767,6 +1800,15 @@ mod tests {
         );
     }
 
+    /// Just one record's rows, to check `a` left it as it was.
+    fn record_rows(doc: &Doc, entry: usize) -> Vec<String> {
+        doc.rows()
+            .iter()
+            .filter(|r| r.entry == entry)
+            .map(|r| r.cells.iter().map(|(_, s)| s.as_str()).collect())
+            .collect()
+    }
+
     /// The menu's lines, indented by the level they are listed at.
     fn menu(doc: &Doc) -> Vec<String> {
         doc.keys()
@@ -1861,22 +1903,63 @@ mod tests {
         assert_eq!(doc.record_depth(0), 1);
     }
 
-    /// Both of these move every row in the document. The record you were reading
-    /// is what the cursor holds on to.
+    /// Both of these move every row in the document. The place you were reading
+    /// is what the cursor holds on to: the exact row while it survives, and the
+    /// record's own row once it doesn't.
     #[test]
     fn all_at_once_keeps_the_cursor_on_its_record() {
         let mut doc = nested();
         doc.expand_to(1);
         doc.set_cursor(7); // a body row of the second record
+        let sub = doc.rows()[doc.cursor()].sub;
         assert_eq!(doc.rows()[doc.cursor()].entry, 1);
 
+        // `a` leaves the cursor's own record alone, so that row is still there.
         doc.expand_all();
         assert_eq!(doc.rows()[doc.cursor()].entry, 1);
-        assert_eq!(doc.rows()[doc.cursor()].sub, 0, "on the record's own row");
+        assert_eq!(doc.rows()[doc.cursor()].sub, sub, "on the very same row");
 
         doc.collapse_all();
         assert_eq!(doc.cursor(), 1);
         assert!(doc.cursor() < doc.rows_len());
+    }
+
+    /// The bug `a` had: it copied the level back onto the record it read it from,
+    /// which unfolded that record's *other* keys at the same level. `a` levels the
+    /// rest of the file and changes nothing about the row it is levelling from.
+    #[test]
+    fn all_at_once_leaves_the_cursors_own_record_alone() {
+        // Two containers side by side at the same level in each record.
+        let mut doc = doc(&[
+            r#"{"m":{"p":1},"n":{"q":2}}"#,
+            r#"{"m":{"p":3},"n":{"q":4}}"#,
+        ]);
+        doc.toggle_row(0); // open the first record: "m" and "n" both folded
+        let m = doc
+            .rows()
+            .iter()
+            .position(|r| r.cells.iter().any(|(_, t)| t.contains("\"m\"")))
+            .expect("the \"m\" row");
+        doc.toggle_row(m); // unfold "m" only, leaving "n" folded beside it
+
+        let before = record_rows(&doc, 0);
+        assert_eq!(doc.expand_all(), Some(2));
+
+        assert_eq!(
+            record_rows(&doc, 0),
+            before,
+            "the record the level was read from is untouched"
+        );
+        let rows = rendered(&doc);
+        assert!(
+            rows.iter().any(|r| r.contains(r#"▸ "n": {"#)),
+            "\"n\" stays folded beside the \"m\" that was opened: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains(r#"▾ "m": {"#)).count(),
+            2,
+            "and the other record has taken the level: {rows:?}"
+        );
     }
 
     #[test]

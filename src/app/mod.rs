@@ -1562,8 +1562,9 @@ impl App {
     }
 
     /// `a` — unfold the whole zoomed document: all of it when the cursor is on a
-    /// folded record, else to the level that record is reading at, from wherever
-    /// inside it the cursor sits.
+    /// folded record, else the rest of it to the level that record is reading at,
+    /// from wherever inside it the cursor sits. The record being matched from is
+    /// left exactly as it is.
     ///
     /// A level is otherwise invisible — a row folded at level 2 looks like one
     /// folded at level 5 — so it is worth saying which one you got.
@@ -1572,7 +1573,7 @@ impl App {
             return;
         };
         match doc.expand_all() {
-            Some(depth) => self.set_status(format!("unfolded everything to level {depth}"), false),
+            Some(depth) => self.set_status(format!("matched the rest to level {depth}"), false),
             None => self.set_status("unfolded everything", false),
         }
     }
