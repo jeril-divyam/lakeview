@@ -11,7 +11,7 @@
 //! Rows are built as `(JsonTok, String)` runs, so the UI colours them through
 //! `Theme::json` and this module stays free of ratatui.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -137,11 +137,37 @@ fn fill(open: &mut Open, value: &Value, levels: usize) {
 /// list of objects, which is most of what JSONL is for.
 fn opened_like(value: &Value, filter: &KeyFilter) -> Open {
     let mut open = Open::default();
-    fill_like(&mut open, value, filter, &mut Vec::new());
+    fill_like(&mut open, value, &|path| filter.is_open(path), &mut Vec::new());
     open
 }
 
-fn fill_like(open: &mut Open, value: &Value, filter: &KeyFilter, path: &mut Vec<String>) {
+/// The same shape taken from another record instead of from the menu: a
+/// container is open when the record being copied from has that key path open.
+/// What `a` spreads across the file.
+///
+/// Keyed by path rather than by level, for the reason the menu is: two
+/// containers side by side are two different keys, and one of them being open
+/// says nothing at all about the other. Levelling records off was `a`'s old bug
+/// — copying "this record reads 4 deep" onto the rest unfolded the siblings the
+/// record itself had left folded.
+fn opened_alike(value: &Value, paths: &HashSet<Vec<String>>) -> Open {
+    let mut open = Open::default();
+    fill_like(
+        &mut open,
+        value,
+        &|path| paths.contains(path),
+        &mut Vec::new(),
+    );
+    open
+}
+
+/// Walk `value`, opening every container whose key path `is_open` accepts.
+fn fill_like(
+    open: &mut Open,
+    value: &Value,
+    is_open: &dyn Fn(&[String]) -> bool,
+    path: &mut Vec<String>,
+) {
     match value {
         Value::Object(map) => {
             for (key, val) in map {
@@ -150,10 +176,10 @@ fn fill_like(open: &mut Open, value: &Value, filter: &KeyFilter, path: &mut Vec<
                     continue;
                 }
                 path.push(key.clone());
-                if filter.is_open(path) {
+                if is_open(path) {
                     let child = open.children.entry(Seg::Key(key.clone())).or_default();
                     child.open = true;
-                    fill_like(child, val, filter, path);
+                    fill_like(child, val, is_open, path);
                 }
                 path.pop();
             }
@@ -165,7 +191,7 @@ fn fill_like(open: &mut Open, value: &Value, filter: &KeyFilter, path: &mut Vec<
                 }
                 let child = open.children.entry(Seg::Index(i)).or_default();
                 child.open = true;
-                fill_like(child, item, filter, path);
+                fill_like(child, item, is_open, path);
             }
         }
         _ => {}
@@ -527,12 +553,18 @@ pub trait Folding {
     /// as `1`, its shallowest.
     fn expand_to(&mut self, depth: usize);
 
-    /// What `a` should unfold to: `Some(level)` to bring the whole document up to
-    /// the level the cursor is reading at, `None` for all of it, however deep.
+    /// Whether `a` has something at the cursor to spread over the rest of the
+    /// document — `Some(depth)`, how deep it reads — or `None`, nothing to go on,
+    /// so `a` opens all of it however deep it goes.
     fn expand_target(&self) -> Option<usize>;
 
     /// `a` — unfold, either as far as it goes or to the level the cursor names.
-    /// Returns the level everything now reads at, or `None` for all of it.
+    /// Returns how deep what the cursor named reads, or `None` when there was
+    /// nothing to go on and all of it was opened.
+    ///
+    /// Levelling is only the default. [`Doc`] overrides this to copy the cursor's
+    /// record shape onto the rest key by key, a level being too blunt to tell two
+    /// containers side by side apart.
     fn expand_all(&mut self) -> Option<usize> {
         let target = self.expand_target();
         self.expand_to(target.unwrap_or(usize::MAX));
@@ -953,6 +985,20 @@ impl Doc {
         self.rows().get(self.cursor).map(|row| row.entry)
     }
 
+    /// The key paths record `entry` has unfolded, named the way the menu names
+    /// them — array indices left out, an array opening with the key above it.
+    /// The shape of a record, as something another record can be matched to:
+    /// what `a` copies across the file and `F` copies into the menu.
+    fn open_paths(&self, entry: usize) -> Vec<Vec<String>> {
+        let mut paths = Vec::new();
+        if let Some(record) = self.entries.get(entry)
+            && let Some(value) = record.shown()
+        {
+            open_key_paths(value, &record.open, &mut Vec::new(), &mut paths);
+        }
+        paths
+    }
+
     /// Open the menu to match a record: a key whose value that record shows
     /// open is a key the menu lists the keys under. What `F` does on the way in,
     /// so the menu opens describing what is already on screen.
@@ -960,12 +1006,7 @@ impl Doc {
     /// Nothing about what the records show changes, so — like `fold_keys` — the
     /// file is not re-pruned.
     pub fn open_keys_to(&mut self, entry: usize) {
-        let mut paths = Vec::new();
-        if let Some(record) = self.entries.get(entry)
-            && let Some(value) = record.shown()
-        {
-            open_key_paths(value, &record.open, &mut Vec::new(), &mut paths);
-        }
+        let paths = self.open_paths(entry);
         self.filter.open_only(&paths);
     }
 
@@ -1073,29 +1114,44 @@ impl Folding for Doc {
         }
     }
 
-    /// `a` levels the *rest* of the file at the cursor's record's level and
-    /// leaves that record exactly as it is. Copying the level back onto the
-    /// record it was read from would flatten it: a record open to level 2 because
-    /// one of its keys is unfolded would come back with every key at that level
-    /// unfolded, which is a change to the very row `a` is copying from. Only a
-    /// record with no level to copy — folded onto its own row — is touched, and
+    /// `a` gives every *other* record the shape of the one the cursor is in, and
+    /// leaves that record exactly as it is.
+    ///
+    /// The shape is a set of key paths, not a level. A level is one number for a
+    /// whole record, and it cannot tell two containers side by side apart: a
+    /// record read down to `"status"` is a record read 4 levels deep, and
+    /// levelling the file at 4 unfolds the `"attributes"` sitting beside it in
+    /// every record — the very thing the reader had left folded. Matching by key
+    /// copies what is open and nothing else.
+    ///
+    /// Copying the shape back onto the record it came from is what `a` used to
+    /// get wrong, so the cursor's record is skipped rather than rebuilt. Only a
+    /// record with no shape to give — folded onto its own row — is touched, and
     /// there `a` means "open all of this", itself included.
     fn expand_all(&mut self) -> Option<usize> {
         let Some(depth) = self.expand_target() else {
             self.expand_to(usize::MAX);
             return None;
         };
+        // `expand_target` found an open record, so there is a row under the
+        // cursor and a record behind it.
         let at = self.rows().get(self.cursor).map(|r| (r.entry, r.sub));
-        let cursors = at.map(|(entry, _)| entry);
-        for (i, entry) in self.entries.iter_mut().enumerate() {
-            if Some(i) == cursors {
+        let (cursor, _) = at?;
+        let shape: HashSet<Vec<String>> = self.open_paths(cursor).into_iter().collect();
+
+        for i in 0..self.entries.len() {
+            if i == cursor {
                 continue;
             }
-            entry.expanded = true;
-            entry.open = match &entry.value {
-                Some(value) => opened_to(value, depth),
+            // Matched against what the record shows, filter and all, the way the
+            // menu's own sync is — a key that is hidden is not a key to open.
+            let open = match self.entries[i].shown() {
+                Some(value) => opened_alike(value, &shape),
                 None => Open::default(),
             };
+            let entry = &mut self.entries[i];
+            entry.expanded = true;
+            entry.open = open;
         }
         // The cursor's record is untouched, so the exact row it was on is still
         // there — only the records above it have changed how many rows they take.
@@ -1922,6 +1978,58 @@ mod tests {
         doc.collapse_all();
         assert_eq!(doc.cursor(), 1);
         assert!(doc.cursor() < doc.rows_len());
+    }
+
+    /// The bug as reported: inside a record, `"status"` unfolded and the
+    /// `"attributes"` beside it left folded. `a` used to level the file at the
+    /// depth `"status"` gave it, which unfolded `"attributes"` in every record —
+    /// including ones the reader had never touched. Matching by key leaves it
+    /// folded, because that is how the record `a` copied from reads.
+    #[test]
+    fn all_at_once_does_not_unfold_a_sibling_the_record_left_folded() {
+        let mut doc = doc(&[
+            r#"{"trace_id":"ddfa","spans":[{"kind":"LLM","status":{"code":"OK"},"attributes":{"model":"gemma","input":{"role":"system"}}}]}"#,
+            r#"{"trace_id":"4782","spans":[{"kind":"LLM","status":{"code":"OK"},"attributes":{"model":"gemini","input":{"role":"user"}}}]}"#,
+        ]);
+        // Read the first record down to "status", the way the screenshot has it:
+        // spans, its element, then status — and "attributes" beside it untouched.
+        doc.toggle_row(0);
+        for key in ["spans", "{", "status"] {
+            let row = doc
+                .rows()
+                .iter()
+                .position(|r| {
+                    r.entry == 0 && r.folded && r.cells.iter().any(|(_, t)| t.contains(key))
+                })
+                .unwrap_or_else(|| panic!("a folded {key} row: {:?}", rendered(&doc)));
+            doc.toggle_row(row);
+        }
+        let before = record_rows(&doc, 0);
+        assert!(
+            before.iter().any(|r| r.contains(r#"▾ "status": {"#)),
+            "{before:?}"
+        );
+        assert!(
+            before.iter().any(|r| r.contains(r#"▸ "attributes": {"#)),
+            "{before:?}"
+        );
+
+        doc.expand_all();
+
+        assert_eq!(
+            record_rows(&doc, 0),
+            before,
+            "the record the shape came from is untouched"
+        );
+        let others = record_rows(&doc, 1);
+        assert!(
+            others.iter().any(|r| r.contains(r#"▾ "status": {"#)),
+            "the second record takes the shape: {others:?}"
+        );
+        assert!(
+            others.iter().any(|r| r.contains(r#"▸ "attributes": {"#)),
+            "and leaves the sibling folded, as the first record has it: {others:?}"
+        );
     }
 
     /// The bug `a` had: it copied the level back onto the record it read it from,

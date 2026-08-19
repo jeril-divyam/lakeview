@@ -1732,7 +1732,7 @@ mod tests {
     // ── all at once ──────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn a_and_c_level_the_whole_zoomed_document() {
+    async fn a_and_c_reshape_the_whole_zoomed_document() {
         let mut app = test_app();
         app.preview.body = Some(PreviewBody::Jsonl(crate::jsonl::parse(
             "{\"a\":1,\"m\":{\"p\":2}}\n{\"a\":3,\"m\":{\"p\":4}}\n",
@@ -1753,13 +1753,13 @@ mod tests {
         assert_eq!(all.matches("▸ {").count(), 2, "both records folded: {all}");
         assert!(all.contains("folded everything"), "{all}");
 
-        // Open one record to its top level and stand on it: now `a` has a level
-        // to copy, and every record is brought to it rather than opened whole.
+        // Open one record to its top level and stand on it: now `a` has a shape
+        // to copy, and every record takes it rather than being opened whole.
         app.open();
         app.expand_all();
         let all = screen(&framed(&mut app, 60, 24));
         assert_eq!(all.matches(r#"▸ "m": {"p":"#).count(), 2, "{all}");
-        assert!(all.contains("to level 1"), "{all}");
+        assert!(all.contains("matched the rest to this record"), "{all}");
     }
 
     /// Nothing outside a foldable zoom has levels, so the keys are quiet there

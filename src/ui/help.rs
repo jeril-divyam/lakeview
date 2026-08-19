@@ -53,9 +53,10 @@ zoomed .jsonl starts folded instead, listing its records a row apiece. \
 space folds it back up too, from its opening row or its closing bracket either way. ← winds back out, \
 folding what is open and stepping out of what is not, and does nothing once nothing is left to \
 close; Esc and Backspace are what leave the zoom. Folded rows are truncated — unfolding is how you see the rest \
-— and everything else wraps. a on a folded row unfolds the whole document, all the way down; on \
-an open one it brings every record to the level that row is open to. c folds all of it back up. A \
-.json has nothing to level itself against, so a opens all of it and c shuts it to its own \
+— and everything else wraps. a on a folded row unfolds the whole document, all the way down; \
+inside an open record it gives every other record that record's shape instead, key for key, and \
+leaves the record it copied from alone. c folds all of it back up. A \
+.json has nothing to match itself against, so a opens all of it and c shuts it to its own \
 members. F over a zoomed .jsonl opens a menu of the keys its records use, \
 each switchable: space switches one, ← → fold the tree, a/n switch all or none, Enter applies and \
 Esc puts the old filter back.";

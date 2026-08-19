@@ -1562,18 +1562,18 @@ impl App {
     }
 
     /// `a` — unfold the whole zoomed document: all of it when the cursor is on a
-    /// folded record, else the rest of it to the level that record is reading at,
-    /// from wherever inside it the cursor sits. The record being matched from is
-    /// left exactly as it is.
+    /// folded record, else give every other record the shape of the one the
+    /// cursor is in, which is left exactly as it is.
     ///
-    /// A level is otherwise invisible — a row folded at level 2 looks like one
-    /// folded at level 5 — so it is worth saying which one you got.
+    /// Which of the two happened is worth saying: the difference between a file
+    /// opened to the last leaf and one matched to a record is easy to miss when
+    /// the record you are reading has not moved.
     pub fn expand_all(&mut self) {
         let Some(doc) = self.focused_doc_mut() else {
             return;
         };
         match doc.expand_all() {
-            Some(depth) => self.set_status(format!("matched the rest to level {depth}"), false),
+            Some(_) => self.set_status("matched the rest to this record", false),
             None => self.set_status("unfolded everything", false),
         }
     }
